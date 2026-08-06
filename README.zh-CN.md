@@ -10,8 +10,6 @@ Zen Tab 是一款面向重度标签用户的 Manifest V3 Chrome 扩展。它不�
 
 ![Zen Tab 侧边栏工作区](docs/screenshots/zen-tab-workspace.png)
 
-![Zen Tab AI 项目分组预览](docs/screenshots/zen-tab-project-map.png)
-
 ## 核心能力
 
 - **实时标签工作区**：在 Chrome 侧边栏中查看多个窗口、原生标签组和未分组标签。

@@ -10,8 +10,6 @@ Zen Tab is a Manifest V3 Chrome extension for people who work with many tabs. It
 
 ![Zen Tab side-panel workspace](docs/screenshots/zen-tab-workspace.png)
 
-![Zen Tab AI project grouping preview](docs/screenshots/zen-tab-project-map.png)
-
 ## Highlights
 
 - **Live tab workspace** — Browse windows, native tab groups, and ungrouped tabs from Chrome's side panel.
