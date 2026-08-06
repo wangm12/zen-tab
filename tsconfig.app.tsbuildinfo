@@ -1,0 +1,1 @@
+{"root":["./src/background/service-worker.ts","./src/shared/ai.test.ts","./src/shared/ai.ts","./src/shared/ids.ts","./src/shared/storage.test.ts","./src/shared/storage.ts","./src/shared/types.ts","./src/shared/url.test.ts","./src/shared/url.ts","./src/sidepanel/app.tsx","./src/sidepanel/i18n.ts","./src/sidepanel/main.tsx","./src/sidepanel/store.ts"],"version":"5.9.3"}

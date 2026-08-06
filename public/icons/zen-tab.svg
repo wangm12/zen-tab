@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <title>Zen Tab</title>
+  <rect width="1024" height="1024" rx="248" fill="#171717"/>
+  <rect x="28" y="28" width="968" height="968" rx="224" stroke="#3B3B3B" stroke-width="24"/>
+
+  <!-- Three calm, offset tab surfaces. The overlap keeps the mark legible at small sizes. -->
+  <path d="M386 174H686C746.751 174 796 223.249 796 284V542H276V284C276 223.249 325.249 174 386 174Z" fill="#646464"/>
+  <path d="M306 278H686C752.274 278 806 331.726 806 398V652H186V398C186 331.726 239.726 278 306 278Z" fill="#A8A8A8"/>
+  <path d="M246 394H630C704.065 394 764 453.935 764 528V728H126V528C126 453.935 185.935 394 260 394H246Z" fill="#F0F0EE"/>
+
+  <!-- Quiet content lines instead of a text monogram. -->
+  <rect x="286" y="526" width="238" height="28" rx="14" fill="#171717"/>
+  <rect x="286" y="584" width="318" height="28" rx="14" fill="#171717" opacity="0.82"/>
+  <rect x="286" y="642" width="166" height="28" rx="14" fill="#171717" opacity="0.64"/>
+</svg>
