@@ -141,6 +141,20 @@ export type GroupProposal = {
   analyzedTabIds?: number[];
 };
 
+export type ProjectMemoryRule = {
+  id: string;
+  projectName: string;
+  tokens: string[];
+  createdAt: number;
+  updatedAt: number;
+  useCount: number;
+};
+
+export type GroupUndoData =
+  | { kind: 'proposal'; ungroupTabIds: number[]; groupIds?: number[] }
+  | { kind: 'metadata'; groupId: number; previousTitle: string; previousColor: GroupColor; nextTitle?: string; nextColor?: GroupColor }
+  | { kind: 'ungroup'; tabs: TabRestoreDescriptor[]; groupTitle: string; groupColor: GroupColor; groupCollapsed: boolean };
+
 export type CleanupCandidate = {
   tabId: number;
   title: string;
@@ -170,6 +184,7 @@ export type ToastMessage = {
 export type ZenTabSnapshot = {
   windows: WindowSnapshot[];
   stashes: StashRecord[];
+  projectMemory: ProjectMemoryRule[];
   settings: ZenTabSettings;
   hasGroqApiKey: boolean;
   lastAction?: ActionJournal;
@@ -192,8 +207,13 @@ export type ZenTabMessage =
   | { type: 'STASH'; windowId: number; scope: 'window' | 'group' | 'tabs'; groupId?: number; tabIds?: number[]; includePinned?: boolean; includeActive?: boolean }
   | { type: 'STASH_WINDOW'; windowId: number; includePinned?: boolean; includeActive?: boolean }
   | { type: 'RESTORE_STASH'; stashId: string }
+  | { type: 'RESTORE_STASH_SELECTION'; stashId: string; selection: { kind: 'tab'; tabId: number } | { kind: 'group'; groupId: number } }
+  | { type: 'RENAME_STASH'; stashId: string; name: string }
   | { type: 'DELETE_STASH'; stashId: string }
   | { type: 'UNDO_ACTION' }
+  | { type: 'CLEAR_PROJECT_MEMORY' }
+  | { type: 'UPDATE_GROUP'; groupId: number; action: 'rename' | 'color'; title?: string; color?: GroupColor }
+  | { type: 'UNGROUP_GROUP'; groupId: number }
   | { type: 'UPDATE_SETTINGS'; patch: Partial<ZenTabSettings> }
   | { type: 'UPDATE_GROQ_KEY'; apiKey: string }
   | { type: 'CLOSE_TABS'; tabIds: number[] }

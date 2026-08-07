@@ -2,7 +2,6 @@ import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from '
 import { useVirtualizer } from '@tanstack/react-virtual';
 import {
   Archive,
-  ArrowDownToLine,
   ArrowUpRight,
   Check,
   ChevronDown,
@@ -15,7 +14,9 @@ import {
   LockKeyhole,
   MicOff,
   MoreHorizontal,
+  Palette,
   PanelLeft,
+  Pencil,
   Pin,
   RefreshCw,
   Search,
@@ -23,14 +24,15 @@ import {
   Sparkles,
   Tag,
   Trash2,
+  Ungroup,
   Undo2,
   Volume2,
   X,
   Zap,
 } from 'lucide-react';
-import { createAIProvider } from '../shared/ai';
+import { applyProjectMemory, createAIProvider } from '../shared/ai';
 import { displayHostname } from '../shared/url';
-import { CleanupProposal, GroupProposal, StashRecord, ZenTabMessage, ZenTabSettings, TabRecord, ToastMessage, WindowSnapshot } from '../shared/types';
+import { CleanupProposal, GroupColor, GroupProposal, StashRecord, ZenTabMessage, ZenTabSettings, TabRecord, ToastMessage, WindowSnapshot } from '../shared/types';
 import { createTranslator, Translator } from './i18n';
 import { useZenTabStore } from './store';
 
@@ -49,6 +51,7 @@ function App() {
     cleanupProposal,
     groupScanProgress,
     busy,
+    restoreProgress,
     toast,
     error,
     load,
@@ -140,7 +143,8 @@ function App() {
         deepScanAll,
       });
       const provider = createAIProvider(snapshot?.settings ?? ({} as ZenTabSettings));
-      const proposal = prepared.proposal ?? await provider.proposeProjects(prepared.inputs);
+      const rawProposal = prepared.proposal ?? await provider.proposeProjects(prepared.inputs);
+      const proposal = applyProjectMemory(prepared.inputs, rawProposal, currentWindow.incognito ? [] : snapshot?.projectMemory ?? []);
       setGroupProposal({ ...proposal, sourceWindowId: currentWindow.windowId, analyzedTabIds: prepared.inputs.map((input) => input.tabId) });
       setModal('group');
       showToast({ id: `${Date.now()}`, tone: 'neutral', message: prepared.deepAnalysisUsed ? t('projectContextEnriched') : t('projectContextMetadata') });
@@ -150,7 +154,7 @@ function App() {
       setBusy(null);
       useZenTabStore.setState({ groupScanProgress: null });
     }
-  }, [currentWindow, request, setBusy, setGroupProposal, setModal, showToast, snapshot?.settings, t]);
+  }, [currentWindow, request, setBusy, setGroupProposal, setModal, showToast, snapshot?.projectMemory, snapshot?.settings, t]);
 
   const runCleanupAnalysis = useCallback(async () => {
     if (!currentWindow) return;
@@ -184,6 +188,12 @@ function App() {
   const stashGroup = useCallback((groupId: number) => {
     void stashSelection({ scope: 'group', groupId, includePinned: false, includeActive: true, busyLabel: t('stashingGroup') });
   }, [stashSelection, t]);
+
+  const stashUngrouped = useCallback(() => {
+    if (!currentWindow) return;
+    const tabIds = currentWindow.tabs.filter((tab) => tab.groupId === -1).map((tab) => tab.tabId);
+    void stashSelection({ scope: 'tabs', tabIds, includePinned: false, includeActive: true, busyLabel: t('stashingUngrouped') });
+  }, [currentWindow, stashSelection, t]);
 
   const handleStashDragOver = useCallback((event: React.DragEvent<HTMLButtonElement>) => {
     if (!event.dataTransfer.types.includes('text/tab-id')) return;
@@ -264,6 +274,17 @@ function App() {
     }
   }, [showToast, t, updateSettingsSafe]);
 
+  const clearProjectMemory = useCallback(async () => {
+    if (!window.confirm(t('clearProjectMemoryConfirm'))) return;
+    try {
+      await request({ type: 'CLEAR_PROJECT_MEMORY' });
+      await load();
+      showToast({ id: `${Date.now()}`, tone: 'success', message: t('projectMemoryCleared') });
+    } catch (memoryError) {
+      showToast({ id: `${Date.now()}`, tone: 'error', message: memoryError instanceof Error ? memoryError.message : t('actionFailed') });
+    }
+  }, [load, request, showToast, t]);
+
   if (!snapshot) return <LoadingState error={error} t={t} />;
 
   return (
@@ -295,7 +316,7 @@ function App() {
               <button className="command-button accent" onClick={() => void runGroupAnalysis()} disabled={Boolean(busy)}><Sparkles size={15} /> {t('groupTabs')}</button>
               <button className="command-button" onClick={() => void runCleanupAnalysis()} disabled={Boolean(busy)}><ListFilter size={15} /> {t('cleanUp')}</button>
               <div className="stash-action-wrap">
-                <button className="command-button" onClick={() => setStashMenuOpen((open) => !open)} disabled={Boolean(busy)} aria-expanded={stashMenuOpen} aria-haspopup="menu"><ArrowDownToLine size={15} /> {t('stash')} <ChevronDown size={13} /></button>
+                <button className="command-button" onClick={() => setStashMenuOpen((open) => !open)} disabled={Boolean(busy)} aria-expanded={stashMenuOpen} aria-haspopup="menu"><Archive size={15} /> {t('stash')} <ChevronDown size={13} /></button>
                 {stashMenuOpen && <div className="stash-popover" role="menu" aria-label={t('stash')}>
                   <button className="stash-menu-item" role="menuitem" onClick={() => void stashSelection({ scope: 'window', includePinned: false, includeActive: false, busyLabel: t('stashingWindow') })}>
                     <span className="stash-menu-icon" aria-hidden="true"><PanelLeft size={15} /></span>
@@ -323,6 +344,7 @@ function App() {
               return next;
             })}
             onStashGroup={stashGroup}
+            onStashUngrouped={stashUngrouped}
             onStashTabs={(tabIds) => void stashSelection({ scope: 'tabs', tabIds, includePinned: true, includeActive: true, busyLabel: t('stashingSelectedTabs') })}
             onCloseTabs={closeSelectedTabs}
             onAction={(message) => {
@@ -333,12 +355,18 @@ function App() {
                 void closeSelectedTabs([message.tabId]);
                 return;
               }
+              if (message.type === 'UNGROUP_GROUP' || message.type === 'UPDATE_GROUP') {
+                void action(message).then((ok) => {
+                  if (ok) showToast({ id: `${Date.now()}`, tone: 'success', message: t('groupUpdated'), action: 'undo' });
+                });
+                return;
+              }
               void action(message);
             }}
           />
         </>
       ) : (
-        <StashList stashes={snapshot.stashes} request={request} showToast={showToast} t={t} />
+        <StashList stashes={snapshot.stashes} search={search} onSearch={setSearch} request={request} showToast={showToast} t={t} restoreProgress={restoreProgress} />
       )}
 
       <footer className="app-footer">
@@ -359,9 +387,9 @@ function App() {
       </footer>
 
       {toast && <Toast key={toast.id} toast={toast} t={t} onDismiss={dismissToast} onUndo={() => void undo()} />}
-      {modal === 'group' && draftGroupProposal && <GroupModal proposal={draftGroupProposal} tabs={proposalTabs} t={t} onChange={setDraftGroupProposal} onClose={() => setModal(null)} onApply={async (selectedIndexes) => { const selectedGroups = draftGroupProposal.groups.filter((_, index) => selectedIndexes.includes(index)); if (await action({ type: 'APPLY_GROUP_PROPOSAL', proposal: { ...draftGroupProposal, groups: selectedGroups } }, t('groupsCreated', { count: selectedGroups.length }), 'undo')) setModal(null); }} />}
+      {modal === 'group' && draftGroupProposal && <GroupModal proposal={draftGroupProposal} tabs={proposalTabs} t={t} onChange={setDraftGroupProposal} onClose={() => setModal(null)} onApply={async (selectedIndexes) => { const selectedGroups = draftGroupProposal.groups.filter((group, index) => selectedIndexes.includes(index) && group.tabIds.length >= 2); if (!selectedGroups.length) { showToast({ id: `${Date.now()}`, tone: 'warning', message: t('noValidGroups') }); return; } if (selectedGroups.some((group) => !group.name.trim() || group.name.trim().length > 42)) { showToast({ id: `${Date.now()}`, tone: 'warning', message: t('invalidGroupName') }); return; } if (await action({ type: 'APPLY_GROUP_PROPOSAL', proposal: { ...draftGroupProposal, groups: selectedGroups } }, t('groupsCreated', { count: selectedGroups.length }), 'undo')) setModal(null); }} />}
       {modal === 'cleanup' && draftCleanupProposal && <CleanupModal proposal={draftCleanupProposal} t={t} onClose={() => setModal(null)} onApply={(tabIds) => applyCleanup(draftCleanupProposal, tabIds)} />}
-      {modal === 'settings' && <SettingsPanel settings={snapshot.settings} hasGroqApiKey={snapshot.hasGroqApiKey} t={t} onClose={() => setModal(null)} onUpdate={updateSettingsSafe} onUpdateProvider={updateAIProvider} onUpdateGroqKey={async (apiKey) => { try { await request({ type: 'UPDATE_GROQ_KEY', apiKey }); await load(); showToast({ id: `${Date.now()}`, tone: 'success', message: t('groqKeySaved') }); } catch (keyError) { showToast({ id: `${Date.now()}`, tone: 'error', message: keyError instanceof Error ? keyError.message : t('couldNotSaveGroqKey') }); } }} onRequestDeepScanAll={requestDeepScanAll} />}
+      {modal === 'settings' && <SettingsPanel settings={snapshot.settings} hasGroqApiKey={snapshot.hasGroqApiKey} t={t} onClose={() => setModal(null)} onUpdate={updateSettingsSafe} onUpdateProvider={updateAIProvider} onUpdateGroqKey={async (apiKey) => { try { await request({ type: 'UPDATE_GROQ_KEY', apiKey }); await load(); showToast({ id: `${Date.now()}`, tone: 'success', message: t('groqKeySaved') }); } catch (keyError) { showToast({ id: `${Date.now()}`, tone: 'error', message: keyError instanceof Error ? keyError.message : t('couldNotSaveGroqKey') }); } }} onRequestDeepScanAll={requestDeepScanAll} onClearProjectMemory={clearProjectMemory} />}
     </main>
   );
 }
@@ -379,7 +407,7 @@ type DropTarget =
   | { kind: 'tab'; tabId: number; position: 'before' | 'after' }
   | { kind: 'group'; groupId: number };
 
-function TabTree({ windowSnapshot, search, collapsed, t, onToggleGroup, onStashGroup, onStashTabs, onCloseTabs, onAction }: { windowSnapshot?: WindowSnapshot; search: string; collapsed: Set<number>; t: Translator; onToggleGroup: (groupId: number) => void; onStashGroup: (groupId: number) => void; onStashTabs: (tabIds: number[]) => void; onCloseTabs: (tabIds: number[]) => Promise<boolean>; onAction: (message: ZenTabMessage) => void }) {
+function TabTree({ windowSnapshot, search, collapsed, t, onToggleGroup, onStashGroup, onStashUngrouped, onStashTabs, onCloseTabs, onAction }: { windowSnapshot?: WindowSnapshot; search: string; collapsed: Set<number>; t: Translator; onToggleGroup: (groupId: number) => void; onStashGroup: (groupId: number) => void; onStashUngrouped: () => void; onStashTabs: (tabIds: number[]) => void; onCloseTabs: (tabIds: number[]) => Promise<boolean>; onAction: (message: ZenTabMessage) => void }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const reorderTimer = useRef<number | undefined>(undefined);
   const [draggedTabId, setDraggedTabId] = useState<number | null>(null);
@@ -570,7 +598,7 @@ function TabTree({ windowSnapshot, search, collapsed, t, onToggleGroup, onStashG
   };
 
   return <>
-    {selectionMode && <div className="selection-bar" role="toolbar" aria-label={t('selected')}><span className="selection-summary"><strong>{selectedIds.length}</strong> {t('selected')} <span className="selection-mode-label">{t('selectionMode')}</span></span><div className="selection-actions"><button className="selection-action" onClick={() => { onStashTabs(selectedIds); clearSelection(); }}><ArrowDownToLine size={14} /> {t('stash')}</button><button className="selection-action" onClick={() => void closeSelected()}><Trash2 size={14} /> {t('close')}</button><button className="selection-clear" onClick={clearSelection} aria-label={t('exitSelection')}>{t('done')}</button></div></div>}
+    {selectionMode && <div className="selection-bar" role="toolbar" aria-label={t('selected')}><span className="selection-summary"><strong>{selectedIds.length}</strong> {t('selected')} <span className="selection-mode-label">{t('selectionMode')}</span></span><div className="selection-actions"><button className="selection-action" onClick={() => { onStashTabs(selectedIds); clearSelection(); }}><Archive size={14} /> {t('stash')}</button><button className="selection-action" onClick={() => void closeSelected()}><Trash2 size={14} /> {t('close')}</button><button className="selection-clear" onClick={clearSelection} aria-label={t('exitSelection')}>{t('done')}</button></div></div>}
     <div className="tree-scroller" ref={scrollRef} tabIndex={0} aria-label={t('liveTabs')} onKeyDown={handleTreeKeyDown} onDragLeave={(event) => { if (event.currentTarget === event.target) setDropTarget(null); }}>
       {draggedTabId != null && <div className={dropTarget?.kind === 'start' ? 'drop-start-bar active' : 'drop-start-bar'} role="button" aria-label={t('moveTabToStart')} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDropTarget({ kind: 'start' }); }} onDrop={dropOnStart} />}
       <div className={reorganizing ? 'tree-canvas reorganizing' : 'tree-canvas'} style={{ height: virtualizer.getTotalSize() }}>{virtualizer.getVirtualItems().map((virtualRow) => {
@@ -578,20 +606,53 @@ function TabTree({ windowSnapshot, search, collapsed, t, onToggleGroup, onStashG
     const isGroupTarget = row.kind === 'group' && dropTarget?.kind === 'group' && dropTarget.groupId === row.id;
     const tabDropPosition = row.kind === 'tab' && dropTarget?.kind === 'tab' && dropTarget.tabId === row.tab.tabId ? dropTarget.position : undefined;
     return <div key={row.kind === 'group' ? `group-${row.id}` : `tab-${row.tab.tabId}`} ref={virtualizer.measureElement} data-index={virtualRow.index} className="tree-position" style={{ transform: `translateY(${virtualRow.start}px)` }}>
-      {row.kind === 'group' ? <GroupRow row={row} t={t} onToggle={() => onToggleGroup(row.id)} onStash={() => onStashGroup(row.id)} onDragOver={(event) => { if (!row.synthetic && draggedTabId != null) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDropTarget({ kind: 'group', groupId: row.id }); } }} onDrop={(event) => { if (!row.synthetic) dropOnGroup(row.id, event); }} isDropTarget={Boolean(isGroupTarget)} /> : <TabRow tab={row.tab} t={t} selected={selectedTabIds.has(row.tab.tabId)} selectionMode={selectionMode} onSelect={(event, forceToggle) => selectTab(row.tab.tabId, event, forceToggle)} onClearSelection={clearSelection} onAction={onAction} onDragStart={beginDrag} onDragEnd={clearDrag} onDragOver={(event) => { if (draggedTabId == null || draggedTabId === row.tab.tabId) return; event.preventDefault(); event.dataTransfer.dropEffect = 'move'; const rect = event.currentTarget.getBoundingClientRect(); const position = event.clientY < rect.top + rect.height / 2 ? 'before' : 'after'; setDropTarget({ kind: 'tab', tabId: row.tab.tabId, position }); }} onDrop={(event) => dropOnTab(row.tab, event)} isDragging={draggedTabId === row.tab.tabId} dropPosition={tabDropPosition} isSettling={settlingTabId === row.tab.tabId} />}
+      {row.kind === 'group' ? <GroupRow row={row} t={t} onToggle={() => onToggleGroup(row.id)} onStash={row.synthetic ? onStashUngrouped : () => onStashGroup(row.id)} onAction={onAction} onDragOver={(event) => { if (!row.synthetic && draggedTabId != null) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDropTarget({ kind: 'group', groupId: row.id }); } }} onDrop={(event) => { if (!row.synthetic) dropOnGroup(row.id, event); }} isDropTarget={Boolean(isGroupTarget)} /> : <TabRow tab={row.tab} t={t} selected={selectedTabIds.has(row.tab.tabId)} selectionMode={selectionMode} onSelect={(event, forceToggle) => selectTab(row.tab.tabId, event, forceToggle)} onClearSelection={clearSelection} onAction={onAction} onDragStart={beginDrag} onDragEnd={clearDrag} onDragOver={(event) => { if (draggedTabId == null || draggedTabId === row.tab.tabId) return; event.preventDefault(); event.dataTransfer.dropEffect = 'move'; const rect = event.currentTarget.getBoundingClientRect(); const position = event.clientY < rect.top + rect.height / 2 ? 'before' : 'after'; setDropTarget({ kind: 'tab', tabId: row.tab.tabId, position }); }} onDrop={(event) => dropOnTab(row.tab, event)} isDragging={draggedTabId === row.tab.tabId} dropPosition={tabDropPosition} isSettling={settlingTabId === row.tab.tabId} />}
     </div>;
   })}</div></div>
   </>;
 }
 
-function GroupRow({ row, t, onToggle, onStash, onDragOver, onDrop, isDropTarget }: { row: Extract<TreeRow, { kind: 'group' }>; t: Translator; onToggle: () => void; onStash: () => void; onDragOver: (event: React.DragEvent<HTMLButtonElement>) => void; onDrop: (event: React.DragEvent<HTMLButtonElement>) => void; isDropTarget: boolean }) {
+function GroupRow({ row, t, onToggle, onStash, onAction, onDragOver, onDrop, isDropTarget }: { row: Extract<TreeRow, { kind: 'group' }>; t: Translator; onToggle: () => void; onStash: () => void; onAction: (message: ZenTabMessage) => void; onDragOver: (event: React.DragEvent<HTMLButtonElement>) => void; onDrop: (event: React.DragEvent<HTMLButtonElement>) => void; isDropTarget: boolean }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [name, setName] = useState(row.name === t('untitledGroup') ? '' : row.name);
+  const colors: GroupColor[] = ['grey', 'blue', 'cyan', 'green', 'yellow', 'orange', 'red', 'pink', 'purple'];
+  const colorLabels: Record<GroupColor, string> = { grey: t('groupColorGrey'), blue: t('groupColorBlue'), cyan: t('groupColorCyan'), green: t('groupColorGreen'), yellow: t('groupColorYellow'), orange: t('groupColorOrange'), red: t('groupColorRed'), pink: t('groupColorPink'), purple: t('groupColorPurple') };
+  useEffect(() => {
+    if (!renaming) setName(row.name === t('untitledGroup') ? '' : row.name);
+  }, [renaming, row.name, t]);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setMenuOpen(false); };
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target?.closest('.group-row-shell')) setMenuOpen(false);
+    };
+    document.addEventListener('keydown', closeOnEscape);
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    return () => {
+      document.removeEventListener('keydown', closeOnEscape);
+      document.removeEventListener('pointerdown', closeOnOutsidePointer);
+    };
+  }, [menuOpen]);
+  const submitRename = () => {
+    onAction({ type: 'UPDATE_GROUP', groupId: row.id, action: 'rename', title: name });
+    setRenaming(false);
+    setMenuOpen(false);
+  };
   return <div className="group-row-shell">
     <button className={isDropTarget ? 'group-row drop-target' : 'group-row'} onClick={onToggle} onDragOver={onDragOver} onDrop={onDrop} aria-expanded={!row.collapsed}>
       <span className="group-chevron">{row.collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}</span>
       <span className={row.synthetic ? 'group-dot neutral' : `group-dot ${row.color}`} />
       <span className="group-name">{row.name}</span><span className="group-count">{row.count}</span>
     </button>
-    {!row.synthetic && <button className="group-stash" onClick={(event) => { event.stopPropagation(); onStash(); }} aria-label={`${t('stash')} ${row.name}`} title={`${t('stash')} ${row.name}`}><ArrowDownToLine size={14} /></button>}
+    <button className="group-stash" onClick={(event) => { event.stopPropagation(); onStash(); }} aria-label={`${t('stash')} ${row.name}`} title={`${t('stash')} ${row.name}`}><Archive size={14} /></button>
+    {!row.synthetic && <button className="group-menu-button" onClick={(event) => { event.stopPropagation(); setMenuOpen((open) => !open); }} aria-label={`${t('tabActions')} ${row.name}`} aria-expanded={menuOpen} aria-haspopup="menu"><MoreHorizontal size={15} /></button>}
+    {!row.synthetic && menuOpen && <div className="group-popover" role="menu">
+      {renaming ? <form className="group-rename-form" onSubmit={(event) => { event.preventDefault(); submitRename(); }}><input autoFocus value={name} onChange={(event) => setName(event.target.value)} maxLength={42} aria-label={t('renameGroup')} /><button className="icon-button subtle" type="submit" aria-label={t('done')}><Check size={14} /></button></form> : <button role="menuitem" onClick={() => setRenaming(true)}><Pencil size={14} /> {t('renameGroup')}</button>}
+      <div className="group-color-menu" role="group" aria-label={t('changeGroupColor')}>{colors.map((color) => <button key={color} className={`group-color-swatch ${color}${row.color === color ? ' selected' : ''}`} onClick={() => { onAction({ type: 'UPDATE_GROUP', groupId: row.id, action: 'color', color }); setMenuOpen(false); }} aria-label={`${t('changeGroupColor')}: ${colorLabels[color]}`} title={colorLabels[color]}><Palette size={11} /></button>)}</div>
+      <button role="menuitem" className="danger" onClick={() => { onAction({ type: 'UNGROUP_GROUP', groupId: row.id }); setMenuOpen(false); }}><Ungroup size={14} /> {t('ungroup')}</button>
+    </div>}
   </div>;
 }
 
@@ -688,21 +749,33 @@ function GroupModal({ proposal, tabs, t, onChange, onClose, onApply }: { proposa
   const [selected, setSelected] = useState(new Set(proposal.groups.flatMap((group, index) => group.confidence === 'low' ? [] : [index])));
   const [applying, setApplying] = useState(false);
   const tabsById = useMemo(() => new Map(tabs.map((tab) => [tab.tabId, tab])), [tabs]);
+  useEffect(() => {
+    setSelected((previous) => new Set([...previous].filter((index) => proposal.groups[index]?.tabIds.length >= 2)));
+  }, [proposal.groups]);
   const confidenceCopy = {
     high: { label: t('strongMatch'), description: t('severalSignals') },
     medium: { label: t('possibleMatch'), description: t('someSignals') },
     low: { label: t('needsReview'), description: t('limitedContext') },
   } as const;
-  const apply = async () => { setApplying(true); await onApply([...selected]); setApplying(false); };
+  const moveTab = (tabId: number, target: number | 'unclassified') => {
+    const groups = proposal.groups.map((group) => ({ ...group, tabIds: group.tabIds.filter((candidateId) => candidateId !== tabId), evidence: [...group.evidence] }));
+    const unclassified = new Set(proposal.unclassifiedTabIds.filter((candidateId) => candidateId !== tabId));
+    if (target === 'unclassified') unclassified.add(tabId);
+    else if (groups[target]) groups[target].tabIds = [...groups[target].tabIds, tabId];
+    onChange({ ...proposal, groups, unclassifiedTabIds: [...unclassified] });
+    setSelected((previous) => new Set([...previous].filter((index) => groups[index]?.tabIds.length >= 2)));
+  };
+  const validSelected = [...selected].filter((index) => proposal.groups[index]?.tabIds.length >= 2);
+  const apply = async () => { setApplying(true); await onApply(validSelected); setApplying(false); };
   return <ModalFrame eyebrow={t('projectMap')} title={t('suggestedGroups', { count: proposal.groups.length })} description={t('checkTabsEvidence')} closeLabel={t('close')} onClose={onClose}>
     <div className="confidence-banner"><Sparkles size={16} /><span><strong>{t('suggestionsToReview')}</strong> · {t('tabsNeedMoreContext', { count: proposal.unclassifiedTabIds.length })}</span><span className="confidence-note">{t('reviewBeforeApplying')}</span></div>
     <div className="proposal-list">{proposal.groups.map((group, index) => <div className={selected.has(index) ? 'proposal-group selected' : 'proposal-group'} key={`${group.name}-${index}`}>
-      <div className="proposal-heading"><label className="check-wrap"><input type="checkbox" aria-label={t('selectGroup', { name: group.name })} checked={selected.has(index)} onChange={() => setSelected((previous) => { const next = new Set(previous); if (next.has(index)) next.delete(index); else next.add(index); return next; })} /><span className="fake-check"><Check size={12} /></span></label><input className="proposal-name" value={group.name} onChange={(event) => onChange({ ...proposal, groups: proposal.groups.map((item, groupIndex) => groupIndex === index ? { ...item, name: event.target.value } : item) })} /><span className={`confidence ${group.confidence}`} title={confidenceCopy[group.confidence].description} aria-label={`${confidenceCopy[group.confidence].label}: ${confidenceCopy[group.confidence].description}`}>{confidenceCopy[group.confidence].label}</span></div>
-      <div className="proposal-tabs">{group.tabIds.map((tabId) => { const tab = tabsById.get(tabId); const title = tab?.title.trim() || t('untitledTab'); const host = tab ? displayHostname(tab.url) : t('pageNoLongerAvailable'); return <span key={tabId} className="proposal-tab" title={tab ? `${title}\n${tab.url}` : title}><span className="mini-dot" /><span className="proposal-tab-copy"><strong className="proposal-tab-title">{title}</strong><small className="proposal-tab-host">{host}</small></span></span>; })}</div>
+      <div className="proposal-heading"><label className="check-wrap"><input type="checkbox" aria-label={t('selectGroup', { name: group.name })} checked={selected.has(index)} disabled={group.tabIds.length < 2} onChange={() => setSelected((previous) => { const next = new Set(previous); if (next.has(index)) next.delete(index); else next.add(index); return next; })} /><span className="fake-check"><Check size={12} /></span></label><input className="proposal-name" value={group.name} onChange={(event) => onChange({ ...proposal, groups: proposal.groups.map((item, groupIndex) => groupIndex === index ? { ...item, name: event.target.value } : item) })} /><span className={`confidence ${group.confidence}`} title={confidenceCopy[group.confidence].description} aria-label={`${confidenceCopy[group.confidence].label}: ${confidenceCopy[group.confidence].description}`}>{confidenceCopy[group.confidence].label}</span></div>
+      <div className="proposal-tabs">{group.tabIds.map((tabId) => { const tab = tabsById.get(tabId); const title = tab?.title.trim() || t('untitledTab'); const host = tab ? displayHostname(tab.url) : t('pageNoLongerAvailable'); return <span key={tabId} className="proposal-tab" title={tab ? `${title}\n${tab.url}` : title}><span className="mini-dot" /><span className="proposal-tab-copy"><strong className="proposal-tab-title">{title}</strong><small className="proposal-tab-host">{host}</small></span><select className="proposal-move" defaultValue="" aria-label={`${t('moveTo')} ${title}`} onChange={(event) => { const value = event.target.value; if (value === 'unclassified') moveTab(tabId, 'unclassified'); else if (value !== '') moveTab(tabId, Number(value)); }}><option value="">{t('moveTo')}…</option>{proposal.groups.map((target, targetIndex) => targetIndex !== index ? <option key={targetIndex} value={targetIndex}>{target.name || t('untitledGroup')}</option> : null)}<option value="unclassified">{t('unclassified')}</option></select></span>; })}</div>
       <div className="evidence-line"><Info size={13} /> {group.evidence.map((evidence) => `${evidence.label}: ${evidence.detail}`).join(' · ')}</div>
     </div>)}</div>
     {proposal.unclassifiedTabIds.length > 0 && <div className="unclassified-note"><CircleHelp size={15} /><span>{t('keptAside', { count: proposal.unclassifiedTabIds.length })}</span></div>}
-    <div className="modal-actions"><button className="text-button" onClick={onClose}>{t('keepAsIs')}</button><button className="primary-button" disabled={applying || selected.size === 0} onClick={() => void apply()}>{applying ? t('applying') : t('createGroups', { count: selected.size })} <ArrowUpRight size={15} /></button></div>
+    <div className="modal-actions"><button className="text-button" onClick={onClose}>{t('keepAsIs')}</button><button className="primary-button" disabled={applying || validSelected.length === 0} onClick={() => void apply()}>{applying ? t('applying') : t('createGroups', { count: validSelected.length })} <ArrowUpRight size={15} /></button></div>
   </ModalFrame>;
 }
 
@@ -724,14 +797,28 @@ function CleanupModal({ proposal, t, onClose, onApply }: { proposal: CleanupProp
 
 function ShieldIcon() { return <LockKeyhole size={16} />; }
 
-function StashList({ stashes, request, showToast, t }: { stashes: StashRecord[]; request: RequestFn; showToast: (toast: ToastMessage) => void; t: Translator }) {
+function StashList({ stashes, search, onSearch, request, showToast, t, restoreProgress }: { stashes: StashRecord[]; search: string; onSearch: (value: string) => void; request: RequestFn; showToast: (toast: ToastMessage) => void; t: Translator; restoreProgress: { stashId: string; completed: number; total: number } | null }) {
   const [loading, setLoading] = useState<string | null>(null);
-  const restore = async (stash: StashRecord) => {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draftName, setDraftName] = useState('');
+  const normalizedSearch = search.trim().toLowerCase();
+  const filteredStashes = stashes.filter((stash) => {
+    if (!normalizedSearch) return true;
+    const searchable = [stash.name, ...stash.tabs.flatMap((tab) => [tab.title, tab.url, displayHostname(tab.url), tab.groupTitle ?? ''])].join(' ').toLowerCase();
+    return searchable.includes(normalizedSearch);
+  });
+
+  const showRestoreError = (error: unknown) => showToast({ id: `${Date.now()}`, tone: 'error', message: error instanceof Error ? error.message : t('couldNotRestoreStash') });
+  const restore = async (stash: StashRecord, selection?: { kind: 'tab'; tabId: number } | { kind: 'group'; groupId: number }) => {
     if (loading) return;
     setLoading(stash.id);
-    try { await request({ type: 'RESTORE_STASH', stashId: stash.id }); showToast({ id: `${Date.now()}`, tone: 'success', message: t('tabsOpening', { count: stash.tabs.length }) }); }
-    catch (error) { showToast({ id: `${Date.now()}`, tone: 'error', message: error instanceof Error ? error.message : t('couldNotRestoreStash') }); }
-    finally { setLoading(null); }
+    try {
+      const result = await request<{ created: number; failed: number }>(selection ? { type: 'RESTORE_STASH_SELECTION', stashId: stash.id, selection } : { type: 'RESTORE_STASH', stashId: stash.id });
+      useZenTabStore.setState({ restoreProgress: null });
+      showToast({ id: `${Date.now()}`, tone: result.failed > 0 ? 'warning' : 'success', message: result.failed > 0 ? t('tabsRestoredWithSkipped', { created: result.created, failed: result.failed }) : t('tabsOpening', { count: result.created }) });
+    } catch (error) { showRestoreError(error); }
+    finally { useZenTabStore.setState({ restoreProgress: null }); setLoading(null); }
   };
   const remove = async (stash: StashRecord) => {
     if (loading) return;
@@ -740,12 +827,44 @@ function StashList({ stashes, request, showToast, t }: { stashes: StashRecord[];
     catch (error) { showToast({ id: `${Date.now()}`, tone: 'error', message: error instanceof Error ? error.message : t('couldNotDeleteStash') }); }
     finally { setLoading(null); }
   };
+  const rename = async (stash: StashRecord) => {
+    const name = draftName.trim();
+    if (!name || name.length > 80) {
+      showToast({ id: `${Date.now()}`, tone: 'warning', message: t('invalidStashName') });
+      return;
+    }
+    try {
+      await request({ type: 'RENAME_STASH', stashId: stash.id, name });
+      setEditingId(null);
+      showToast({ id: `${Date.now()}`, tone: 'success', message: t('stashRenamed') });
+    } catch (error) {
+      showToast({ id: `${Date.now()}`, tone: 'error', message: error instanceof Error ? error.message : t('actionFailed') });
+    }
+  };
+  const renderDetails = (stash: StashRecord) => {
+    const groups = new Map<number, typeof stash.tabs>();
+    const ungrouped: typeof stash.tabs = [];
+    for (const tab of stash.tabs) {
+      if (tab.groupId === -1) ungrouped.push(tab);
+      else groups.set(tab.groupId, [...(groups.get(tab.groupId) ?? []), tab]);
+    }
+    const groupEntries = [...groups.entries()];
+    return <div className="stash-details">
+      {groupEntries.map(([groupId, tabs]) => <div className="stash-detail-group" key={`${stash.id}-group-${groupId}`}>
+        <div className="stash-detail-heading"><span><span className="group-dot blue" /> {tabs[0]?.groupTitle || t('untitledGroup')} <small>{tabs.length}</small></span><button className="small-button" disabled={loading !== null} onClick={() => void restore(stash, { kind: 'group', groupId })}><ArrowUpRight size={13} /> {t('restoreGroup')}</button></div>
+        {tabs.map((tab) => <div className="stash-tab-item" key={`${stash.id}-${tab.tabId ?? tab.url}-${tab.index}`}><span className="stash-tab-copy"><Globe2 size={12} /><span><strong>{tab.title || t('untitledTab')}</strong><small>{displayHostname(tab.url)}</small></span></span><button className="icon-button subtle" disabled={loading !== null || typeof tab.tabId !== 'number'} onClick={() => typeof tab.tabId === 'number' && void restore(stash, { kind: 'tab', tabId: tab.tabId })} aria-label={`${t('restoreTab')} ${tab.title}`} title={t('restoreTab')}><ArrowUpRight size={14} /></button></div>)}
+      </div>)}
+      {ungrouped.length > 0 && <div className="stash-detail-group"><div className="stash-detail-heading"><span><span className="group-dot neutral" /> {t('ungrouped')} <small>{ungrouped.length}</small></span></div>{ungrouped.map((tab) => <div className="stash-tab-item" key={`${stash.id}-${tab.tabId ?? tab.url}-${tab.index}`}><span className="stash-tab-copy"><Globe2 size={12} /><span><strong>{tab.title || t('untitledTab')}</strong><small>{displayHostname(tab.url)}</small></span></span><button className="icon-button subtle" disabled={loading !== null || typeof tab.tabId !== 'number'} onClick={() => typeof tab.tabId === 'number' && void restore(stash, { kind: 'tab', tabId: tab.tabId })} aria-label={`${t('restoreTab')} ${tab.title}`} title={t('restoreTab')}><ArrowUpRight size={14} /></button></div>)}</div>}
+    </div>;
+  };
   return <section className="stash-view"><div className="section-intro"><div><span className="eyebrow">{t('recoverableContext')}</span><h2>{t('stashLibrary')}</h2><p>{t('stashLibraryDescription')}</p></div><div className="stash-total"><span>{stashes.length}</span><small>{t('saved')}</small></div></div>
-    {stashes.length === 0 ? <div className="empty-state stash-empty"><div className="empty-orbit"><Archive size={22} /></div><strong>{t('nextFocus')}</strong><p>{t('stashEmptyDescription')}</p></div> : <div className="stash-list">{stashes.map((stash) => <article className="stash-item" key={stash.id}><div className="stash-icon"><Archive size={17} /></div><div className="stash-copy"><strong>{stash.name}</strong><span>{t('tabsCount', { count: stash.tabs.length })} · {new Date(stash.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span><div className="stash-preview">{stash.tabs.slice(0, 3).map((tab) => <span key={`${stash.id}-${tab.tabId ?? tab.url}`} title={tab.title}><Globe2 size={12} /> {displayHostname(tab.url)}</span>)}</div></div><div className="stash-actions"><button className="small-button" disabled={loading !== null} onClick={() => void restore(stash)}>{loading === stash.id ? <RefreshCw className="spin" size={14} /> : <ArrowUpRight size={14} />} {t('restore')}</button><button className="icon-button subtle" disabled={loading !== null} onClick={() => void remove(stash)} aria-label={`${t('delete')} ${stash.name}`}><Trash2 size={15} /></button></div></article>)}</div>}
+    <label className="search-box stash-search"><Search size={16} /><input value={search} onChange={(event) => onSearch(event.target.value)} placeholder={t('stashSearch')} aria-label={t('stashSearch')} />{search && <button className="search-clear" onClick={() => onSearch('')} aria-label={t('close')}><X size={13} /></button>}</label>
+    {loading && restoreProgress?.stashId === loading && <div className="stash-progress" role="status">{t('restoringTabs')} · {restoreProgress.completed}/{restoreProgress.total}</div>}
+    {stashes.length === 0 ? <div className="empty-state stash-empty"><div className="empty-orbit"><Archive size={22} /></div><strong>{t('nextFocus')}</strong><p>{t('stashEmptyDescription')}</p></div> : filteredStashes.length === 0 ? <div className="empty-state stash-empty"><div className="empty-orbit"><Search size={22} /></div><strong>{t('noMatchingStashes')}</strong><p>{t('tryShorterTitle')}</p></div> : <div className="stash-list">{filteredStashes.map((stash) => <article className={expandedId === stash.id ? 'stash-item expanded' : 'stash-item'} key={stash.id}><div className="stash-icon"><Archive size={17} /></div><div className="stash-copy"><div className="stash-title-row">{editingId === stash.id ? <form className="stash-rename-form" onSubmit={(event) => { event.preventDefault(); void rename(stash); }}><input autoFocus maxLength={80} value={draftName} onChange={(event) => setDraftName(event.target.value)} onKeyDown={(event) => { if (event.key === 'Escape') setEditingId(null); }} aria-label={t('renameStash')} /><button className="icon-button subtle" type="submit" aria-label={t('done')}><Check size={14} /></button></form> : <><strong>{stash.name}</strong><button className="icon-button subtle stash-edit" onClick={() => { setEditingId(stash.id); setDraftName(stash.name); }} aria-label={`${t('renameStash')} ${stash.name}`} title={t('renameStash')}><Pencil size={13} /></button></>}</div><span>{t('tabsCount', { count: stash.tabs.length })} · {new Date(stash.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span><div className="stash-preview">{stash.tabs.slice(0, 3).map((tab) => <span key={`${stash.id}-${tab.tabId ?? tab.url}`} title={tab.title}><Globe2 size={12} /> {displayHostname(tab.url)}</span>)}</div></div><div className="stash-actions"><button className="small-button" disabled={loading !== null} onClick={() => void restore(stash)}>{loading === stash.id ? <RefreshCw className="spin" size={14} /> : <ArrowUpRight size={14} />} {t('restore')}</button><button className="icon-button subtle" disabled={loading !== null} onClick={() => setExpandedId((current) => current === stash.id ? null : stash.id)} aria-label={expandedId === stash.id ? t('collapseStash') : t('expandStash')} title={expandedId === stash.id ? t('collapseStash') : t('expandStash')}>{expandedId === stash.id ? <ChevronDown size={15} /> : <ChevronRight size={15} />}</button><button className="icon-button subtle" disabled={loading !== null} onClick={() => void remove(stash)} aria-label={`${t('delete')} ${stash.name}`}><Trash2 size={15} /></button></div>{expandedId === stash.id && renderDetails(stash)}</article>)}</div>}
   </section>;
 }
 
-function SettingsPanel({ settings, hasGroqApiKey, t, onClose, onUpdate, onUpdateProvider, onUpdateGroqKey, onRequestDeepScanAll }: { settings: ZenTabSettings; hasGroqApiKey: boolean; t: Translator; onClose: () => void; onUpdate: (patch: Partial<ZenTabSettings>) => Promise<void>; onUpdateProvider: (provider: ZenTabSettings['aiProvider']) => Promise<void>; onUpdateGroqKey: (apiKey: string) => Promise<void>; onRequestDeepScanAll: (enabled: boolean) => Promise<void> }) {
+function SettingsPanel({ settings, hasGroqApiKey, t, onClose, onUpdate, onUpdateProvider, onUpdateGroqKey, onRequestDeepScanAll, onClearProjectMemory }: { settings: ZenTabSettings; hasGroqApiKey: boolean; t: Translator; onClose: () => void; onUpdate: (patch: Partial<ZenTabSettings>) => Promise<void>; onUpdateProvider: (provider: ZenTabSettings['aiProvider']) => Promise<void>; onUpdateGroqKey: (apiKey: string) => Promise<void>; onRequestDeepScanAll: (enabled: boolean) => Promise<void>; onClearProjectMemory: () => Promise<void> }) {
   const [apiKey, setApiKey] = useState('');
   const [protectedDomains, setProtectedDomains] = useState(settings.protectedDomains.join(', '));
   const safelyUpdate = (patch: Partial<ZenTabSettings>) => { void onUpdate(patch).catch(() => undefined); };
@@ -758,6 +877,7 @@ function SettingsPanel({ settings, hasGroqApiKey, t, onClose, onUpdate, onUpdate
     <div className="settings-section"><div className="settings-heading"><div><strong>{t('deepScanAll')}</strong><span>{t('deepScanDescription')}</span></div><Toggle label={t('deepScanAll')} checked={settings.deepAnalysisEnabled} onChange={safelyRequestDeepScan} /></div><div className="privacy-note"><LockKeyhole size={14} /><span>{t('deepScanPrivacy')}</span></div></div>
     <div className="settings-section"><div className="settings-heading"><div><strong>{t('aiProvider')}</strong><span>{t('localAutomatic')}</span></div><select className="inline-select" value={settings.aiProvider} onChange={(event) => safelyUpdateProvider(event.target.value as ZenTabSettings['aiProvider'])}><option value="local">{t('localAutomatic')}</option><option value="groq">{t('groqByok')}</option></select></div>{settings.aiProvider === 'groq' && <><label className="field-label" htmlFor="groq-api-key">{t('groqApiKey')}<input id="groq-api-key" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} onBlur={() => { if (apiKey.trim()) void onUpdateGroqKey(apiKey.trim()); }} placeholder={hasGroqApiKey ? t('savedLocally') : 'gsk_…'} /></label>{hasGroqApiKey && <button className="text-button key-clear" type="button" onClick={() => { setApiKey(''); void onUpdateGroqKey(''); }}>{t('clearApiKey')}</button>}<div className="privacy-note"><LockKeyhole size={14} /><span>{t('groqPrivacy')}</span></div></>}</div>
     <div className="settings-section"><div className="settings-heading"><div><label htmlFor="protected-domains"><strong>{t('protectedDomains')}</strong></label><span>{t('protectedDomainsDescription')}</span></div><Tag size={16} className="section-icon" /></div><input id="protected-domains" className="full-input" value={protectedDomains} onChange={(event) => setProtectedDomains(event.target.value)} onBlur={() => safelyUpdate({ protectedDomains: protectedDomains.split(',').map((domain) => domain.trim().toLowerCase()).filter(Boolean) })} placeholder={t('protectedDomainsPlaceholder')} /></div>
+    <div className="settings-section memory-settings"><div className="settings-heading"><div><strong>{t('clearProjectMemory')}</strong><span>{t('clearProjectMemoryDescription')}</span></div><button className="text-button danger-outline" type="button" onClick={() => void onClearProjectMemory()}>{t('clearProjectMemory')}</button></div></div>
     <div className="settings-footnote"><Info size={14} /> {t('settingsFootnote')}</div>
   </ModalFrame>;
 }

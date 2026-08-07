@@ -1,4 +1,4 @@
-import { createAIProvider, heuristicCleanup } from '../shared/ai';
+import { buildProjectMemoryRules, createAIProvider, heuristicCleanup } from '../shared/ai';
 import { createId } from '../shared/ids';
 import { canonicalizeUrl, displayHostname, getHostname, isLocalAddress, isSpecialUrl } from '../shared/url';
 import {
@@ -15,6 +15,8 @@ import {
   ProjectTabInput,
   CleanupProposal,
   GroupScanProgress,
+  GroupUndoData,
+  ProjectMemoryRule,
   TabRestoreDescriptor,
 } from '../shared/types';
 import {
@@ -23,11 +25,15 @@ import {
   listStashes,
   loadGroqApiKey,
   loadLastAction,
+  loadProjectMemory,
   loadSettings,
+  clearProjectMemory,
   saveGroqApiKey,
   saveLastAction,
+  saveProjectMemory,
   saveSettings,
   saveStash,
+  updateStash,
 } from '../shared/storage';
 
 const tabIndex = new Map<number, TabRecord>();
@@ -61,6 +67,7 @@ let broadcastTimer: ReturnType<typeof setTimeout> | undefined;
 let focusedWindowId: number = chrome.windows.WINDOW_ID_NONE;
 let groqApiKey = '';
 let stashesCache: StashRecord[] = [];
+let projectMemory: ProjectMemoryRule[] = [];
 let snapshotCache: ZenTabSnapshot | undefined;
 let snapshotDirty = true;
 let mutationQueue = Promise.resolve();
@@ -144,6 +151,7 @@ async function initialize(): Promise<void> {
     settings = await loadSettings();
     lastAction = await loadLastAction();
     stashesCache = await listStashes();
+    projectMemory = await loadProjectMemory();
     groqApiKey = await loadGroqApiKey();
     try {
       focusedWindowId = (await chrome.windows.getLastFocused()).id ?? chrome.windows.WINDOW_ID_NONE;
@@ -226,6 +234,7 @@ async function buildSnapshot(): Promise<ZenTabSnapshot> {
     snapshotCache = {
       windows: getWindowSnapshots(),
       stashes: stashesCache,
+      projectMemory,
       settings,
       hasGroqApiKey: Boolean(groqApiKey),
       lastAction,
@@ -404,8 +413,7 @@ async function prepareGroupInputs(windowId: number, deepScanAll: boolean): Promi
   await initialize();
   const eligible = [...tabIndex.values()]
     .filter((tab) => tab.windowId === windowId && (settings.incognitoEnabled || !tab.incognito) && !tab.pinned && tab.groupId === -1 && !isSpecialUrl(tab.url))
-    .sort((left, right) => left.index - right.index)
-    .slice(0, 300);
+    .sort((left, right) => left.index - right.index);
   const inputs = eligible.map((tab) => createTabInput(tab));
   const finalize = async (preparedInputs: ProjectTabInput[], deepAnalysisUsed: boolean) => {
     if (settings.aiProvider !== 'groq' || !groqApiKey) return { inputs: preparedInputs, deepAnalysisUsed };
@@ -492,7 +500,9 @@ async function applyGroupProposal(proposal: GroupProposal): Promise<{ groupsCrea
   }
   const changedTabIds = [...seen];
   if (!changedTabIds.length) throw new Error('The proposed tabs are no longer available.');
+  const memoryInputs = changedTabIds.map((tabId) => tabIndex.get(tabId)).filter((tab): tab is TabRecord => Boolean(tab && !tab.incognito)).map((tab) => createTabInput(tab));
   const groupedTabIds: number[] = [];
+  const createdGroupIds: number[] = [];
   try {
   for (const group of validatedGroups) {
     const tabIds = group.tabIds;
@@ -502,21 +512,69 @@ async function applyGroupProposal(proposal: GroupProposal): Promise<{ groupsCrea
       color: ['blue', 'cyan', 'green', 'yellow', 'orange', 'red', 'pink', 'purple'][groupId % 8] as chrome.tabGroups.ColorEnum,
       collapsed: false,
     });
+    createdGroupIds.push(groupId);
     groupedTabIds.push(...tabIds);
   }
   } catch (error) {
     if (groupedTabIds.length) await chrome.tabs.ungroup(groupedTabIds).catch(() => undefined);
     throw error;
   }
+  try {
+    projectMemory = buildProjectMemoryRules(memoryInputs, proposal, projectMemory);
+    await saveProjectMemory(projectMemory);
+    snapshotDirty = true;
+  } catch {
+    // Grouping remains successful if optional local memory cannot be persisted.
+  }
   await persistAction({
     actionId: createId('action'),
     type: 'group',
     createdAt: Date.now(),
     affectedTabIds: changedTabIds,
-    restoreData: { ungroupTabIds: changedTabIds },
+    restoreData: { group: { kind: 'proposal', ungroupTabIds: changedTabIds, groupIds: createdGroupIds } satisfies GroupUndoData },
     expiresAt: Date.now() + 30_000,
   });
   return { groupsCreated: validatedGroups.length };
+}
+
+async function updateGroup(groupId: number, action: 'rename' | 'color', title?: string, color?: TabGroupRecord['color']): Promise<{ updated: true }> {
+  const group = groupIndex.get(groupId);
+  if (!group) throw new Error('That tab group is no longer available.');
+  if (action === 'rename') {
+    const rawTitle = (title ?? '').trim();
+    if (rawTitle.length > 42) throw new Error('Group names must be 42 characters or fewer.');
+    const nextTitle = rawTitle;
+    await chrome.tabGroups.update(groupId, { title: nextTitle });
+  } else {
+    if (!color) throw new Error('A tab group color is required.');
+    await chrome.tabGroups.update(groupId, { color });
+  }
+  await persistAction({
+    actionId: createId('action'),
+    type: 'group',
+    createdAt: Date.now(),
+    affectedTabIds: [...tabIndex.values()].filter((tab) => tab.groupId === groupId).map((tab) => tab.tabId),
+    restoreData: { group: { kind: 'metadata', groupId, previousTitle: group.title, previousColor: group.color, nextTitle: action === 'rename' ? (title ?? '').trim() : group.title, nextColor: action === 'color' ? color : group.color } satisfies GroupUndoData },
+    expiresAt: Date.now() + 30_000,
+  });
+  return { updated: true };
+}
+
+async function ungroupGroup(groupId: number): Promise<{ ungrouped: number }> {
+  const group = groupIndex.get(groupId);
+  if (!group) throw new Error('That tab group is no longer available.');
+  const tabs = [...tabIndex.values()].filter((tab) => tab.groupId === groupId);
+  if (!tabs.length) throw new Error('That tab group has no available tabs.');
+  await chrome.tabs.ungroup(tabs.map((tab) => tab.tabId));
+  await persistAction({
+    actionId: createId('action'),
+    type: 'group',
+    createdAt: Date.now(),
+    affectedTabIds: tabs.map((tab) => tab.tabId),
+    restoreData: { group: { kind: 'ungroup', tabs: tabs.map((tab) => restoreDescriptorFromTab(tab, group)), groupTitle: group.title, groupColor: group.color, groupCollapsed: group.collapsed } satisfies GroupUndoData },
+    expiresAt: Date.now() + 30_000,
+  });
+  return { ungrouped: tabs.length };
 }
 
 async function buildCleanupProposal(windowId: number): Promise<CleanupProposal> {
@@ -686,7 +744,7 @@ async function windowExists(windowId: number): Promise<boolean> {
   }
 }
 
-async function restoreDescriptors(descriptors: TabRestoreDescriptor[], preferredWindowId?: number, focus = false, onProgress?: (completed: number, total: number) => void): Promise<{ created: number; failed: number }> {
+async function restoreDescriptors(descriptors: TabRestoreDescriptor[], preferredWindowId?: number, focus = false, onProgress?: (completed: number, total: number) => void, incognito = false): Promise<{ created: number; failed: number }> {
   const normalized = descriptors.map((descriptor, index) => ({
     ...descriptor,
     windowId: typeof descriptor.windowId === 'number' ? descriptor.windowId : preferredWindowId ?? -1,
@@ -703,7 +761,7 @@ async function restoreDescriptors(descriptors: TabRestoreDescriptor[], preferred
   let initialCreatedTabId: number | undefined;
   if (targetWindowId == null || !(await windowExists(targetWindowId))) {
     const first = ordered[0];
-    const created = await chrome.windows.create({ url: first.url, focused: focus });
+    const created = await chrome.windows.create({ url: first.url, focused: focus, incognito });
     if (created.id == null) throw new Error('Could not create a restore window.');
     targetWindowId = created.id;
     createdWindow = true;
@@ -766,9 +824,9 @@ async function restoreAction(): Promise<boolean> {
     lastAction = undefined;
     return false;
   }
-  const data = lastAction.restoreData as { stashId?: string; tabs?: TabRestoreDescriptor[]; ungroupTabIds?: number[]; kind?: 'duplicate'; newTab?: TabRestoreDescriptor; candidate?: DuplicateUndoData['candidate'] } | undefined;
+  const data = lastAction.restoreData as { stashId?: string; tabs?: TabRestoreDescriptor[]; ungroupTabIds?: number[]; group?: GroupUndoData; kind?: 'duplicate'; newTab?: TabRestoreDescriptor; candidate?: DuplicateUndoData['candidate']; incognito?: boolean } | undefined;
   if (lastAction.type === 'stash' && data?.tabs?.length) {
-    const result = await restoreDescriptors(data.tabs, data.tabs[0].windowId, true);
+    const result = await restoreDescriptors(data.tabs, data.tabs[0].windowId, true, undefined, Boolean(data.incognito));
     if (result.failed > 0) throw new Error('Some stashed tabs could not be restored.');
     if (data.stashId) {
       await deleteStash(data.stashId);
@@ -778,8 +836,46 @@ async function restoreAction(): Promise<boolean> {
     lastAction = undefined;
     return true;
   }
+  if (lastAction.type === 'group' && data?.group?.kind === 'proposal') {
+    const allowedGroups = data.group.groupIds?.length ? new Set(data.group.groupIds) : undefined;
+    const liveTabIds = data.group.ungroupTabIds.filter((tabId) => {
+      const tab = tabIndex.get(tabId);
+      return Boolean(tab && tab.groupId !== -1 && (!allowedGroups || allowedGroups.has(tab.groupId)));
+    });
+    if (!liveTabIds.length) throw new Error('The project groups changed; Undo was skipped.');
+    await chrome.tabs.ungroup(liveTabIds);
+    await clearLastAction();
+    lastAction = undefined;
+    return true;
+  }
   if (lastAction.type === 'group' && data?.ungroupTabIds) {
-    await chrome.tabs.ungroup(data.ungroupTabIds.filter((tabId) => tabIndex.has(tabId)));
+    const liveTabIds = data.ungroupTabIds.filter((tabId) => tabIndex.get(tabId)?.groupId !== -1);
+    if (!liveTabIds.length) throw new Error('The project groups changed; Undo was skipped.');
+    await chrome.tabs.ungroup(liveTabIds);
+    await clearLastAction();
+    lastAction = undefined;
+    return true;
+  }
+  if (lastAction.type === 'group' && data?.group?.kind === 'metadata') {
+    const group = groupIndex.get(data.group.groupId);
+    if (!group) throw new Error('That tab group no longer exists; Undo was skipped.');
+    if ((data.group.nextTitle != null && group.title !== data.group.nextTitle) || (data.group.nextColor != null && group.color !== data.group.nextColor)) {
+      throw new Error('That tab group changed after the action; Undo was skipped.');
+    }
+    await chrome.tabGroups.update(data.group.groupId, { title: data.group.previousTitle, color: data.group.previousColor });
+    await clearLastAction();
+    lastAction = undefined;
+    return true;
+  }
+  if (lastAction.type === 'group' && data?.group?.kind === 'ungroup') {
+    const descriptors = data.group.tabs.filter((descriptor) => {
+      const tabId = descriptor.tabId;
+      return typeof tabId === 'number' && tabIndex.get(tabId)?.groupId === -1;
+    });
+    const liveTabIds = descriptors.map((tab) => tab.tabId).filter((tabId): tabId is number => typeof tabId === 'number');
+    if (!liveTabIds.length) throw new Error('The tab group changed; Undo was skipped.');
+    const groupId = await chrome.tabs.group({ tabIds: liveTabIds });
+    await chrome.tabGroups.update(groupId, { title: data.group.groupTitle, color: data.group.groupColor, collapsed: data.group.groupCollapsed });
     await clearLastAction();
     lastAction = undefined;
     return true;
@@ -874,7 +970,7 @@ async function stashTabs(windowId: number, scope: 'window' | 'group' | 'tabs', g
       type: 'stash',
       createdAt: Date.now(),
       affectedTabIds: closedDescriptors.map((descriptor) => descriptor.tabId ?? -1),
-      restoreData: { stashId: stash.id, tabs: closedDescriptors },
+      restoreData: { stashId: stash.id, tabs: closedDescriptors, incognito: stash.incognito },
       expiresAt: Date.now() + 30_000,
     });
   }
@@ -882,13 +978,33 @@ async function stashTabs(windowId: number, scope: 'window' | 'group' | 'tabs', g
   return stash;
 }
 
-async function restoreStash(stashId: string): Promise<void> {
+async function restoreStash(stashId: string): Promise<{ created: number; failed: number }> {
   const stash = stashesCache.find((item) => item.id === stashId);
   if (!stash) throw new Error('Stash not found.');
-  const validTabs = stash.tabs.filter((tab) => !isSpecialUrl(tab.url));
-  if (!validTabs.length) throw new Error('This stash has no restorable tabs.');
-  const result = await restoreDescriptors(validTabs, undefined, true, (completed, total) => sendEvent({ type: 'RESTORE_PROGRESS', stashId, completed, total }));
-  if (result.failed > 0) throw new Error(`${result.failed} tabs could not be restored.`);
+  if (stash.incognito && !settings.incognitoEnabled) throw new Error('Incognito restore is disabled in Settings.');
+  if (!stash.tabs.length) throw new Error('This stash has no tabs to restore.');
+  return restoreDescriptors(stash.tabs, undefined, true, (completed, total) => sendEvent({ type: 'RESTORE_PROGRESS', stashId, completed, total }), stash.incognito);
+}
+
+async function restoreStashSelection(stashId: string, selection: { kind: 'tab'; tabId: number } | { kind: 'group'; groupId: number }): Promise<{ created: number; failed: number }> {
+  const stash = stashesCache.find((item) => item.id === stashId);
+  if (!stash) throw new Error('Stash not found.');
+  if (stash.incognito && !settings.incognitoEnabled) throw new Error('Incognito restore is disabled in Settings.');
+  const selected = selection.kind === 'tab'
+    ? stash.tabs.filter((tab) => tab.tabId === selection.tabId)
+    : stash.tabs.filter((tab) => tab.groupId === selection.groupId && selection.groupId !== -1);
+  if (!selected.length) throw new Error('That Stash item is no longer available.');
+  return restoreDescriptors(selected, undefined, true, (completed, total) => sendEvent({ type: 'RESTORE_PROGRESS', stashId, completed, total }), stash.incognito);
+}
+
+async function renameStash(stashId: string, name: string): Promise<StashRecord> {
+  const stash = stashesCache.find((item) => item.id === stashId);
+  if (!stash) throw new Error('Stash not found.');
+  const trimmed = name.trim();
+  if (!trimmed || trimmed.length > 80) throw new Error('Stash names must be between 1 and 80 characters.');
+  const renamed = await updateStash(stashId, (current) => ({ ...current, name: trimmed }));
+  stashesCache = await listStashes();
+  return renamed;
 }
 
 async function handleMessage(message: ZenTabMessage): Promise<unknown> {
@@ -930,12 +1046,20 @@ async function handleMessage(message: ZenTabMessage): Promise<unknown> {
       return stashTabs(message.windowId, 'window', undefined, undefined, Boolean(message.includePinned), Boolean(message.includeActive));
     case 'RESTORE_STASH':
       return restoreStash(message.stashId);
+    case 'RESTORE_STASH_SELECTION':
+      return restoreStashSelection(message.stashId, message.selection);
+    case 'RENAME_STASH':
+      return renameStash(message.stashId, message.name);
     case 'DELETE_STASH':
       await deleteStash(message.stashId);
       stashesCache = stashesCache.filter((stash) => stash.id !== message.stashId);
       return { deleted: true };
     case 'UNDO_ACTION':
       return { undone: await restoreAction() };
+    case 'CLEAR_PROJECT_MEMORY':
+      await clearProjectMemory();
+      projectMemory = [];
+      return { cleared: true };
     case 'UPDATE_SETTINGS':
       settings = { ...settings, ...message.patch };
       if (message.patch.aiProvider && message.patch.aiProvider !== 'groq') {
@@ -958,6 +1082,10 @@ async function handleMessage(message: ZenTabMessage): Promise<unknown> {
     case 'GROUP_TAB':
       if (message.groupId !== -1) await chrome.tabs.group({ tabIds: [message.tabId], groupId: message.groupId });
       return { grouped: true };
+    case 'UPDATE_GROUP':
+      return updateGroup(message.groupId, message.action, message.title, message.color);
+    case 'UNGROUP_GROUP':
+      return ungroupGroup(message.groupId);
     case 'UPDATE_TAB':
       if (message.action === 'discard') await chrome.tabs.discard(message.tabId);
       else if (message.action === 'close') return { closed: await closeTabsWithJournal([message.tabId], 'cleanup') };
@@ -983,13 +1111,18 @@ function isMutationMessage(message: ZenTabMessage): boolean {
     || message.type === 'STASH'
     || message.type === 'STASH_WINDOW'
     || message.type === 'RESTORE_STASH'
+    || message.type === 'RESTORE_STASH_SELECTION'
+    || message.type === 'RENAME_STASH'
     || message.type === 'DELETE_STASH'
     || message.type === 'UNDO_ACTION'
+    || message.type === 'CLEAR_PROJECT_MEMORY'
     || message.type === 'UPDATE_SETTINGS'
     || message.type === 'UPDATE_GROQ_KEY'
     || message.type === 'CLOSE_TABS'
     || message.type === 'MOVE_TAB'
     || message.type === 'GROUP_TAB'
+    || message.type === 'UPDATE_GROUP'
+    || message.type === 'UNGROUP_GROUP'
     || message.type === 'UPDATE_TAB';
 }
 

@@ -5,6 +5,7 @@ import {
   CleanupCandidate,
   GroupProposal,
   ProjectGroupProposal,
+  ProjectMemoryRule,
   ProjectTabInput,
   ProviderCapabilities,
   ZenTabSettings,
@@ -30,6 +31,19 @@ function weightedTokens(input: ProjectTabInput): WeightedTokens {
   for (const token of summaryTokens) weights.set(token, (weights.get(token) ?? 0) + 2);
   for (const token of GENERIC_TOKENS) weights.delete(token);
   return weights;
+}
+
+function memoryTokensForInput(input: ProjectTabInput): Set<string> {
+  return new Set(weightedTokens(input).keys());
+}
+
+function memoryMatchScore(input: ProjectTabInput, rule: ProjectMemoryRule): number {
+  const inputTokens = memoryTokensForInput(input);
+  const ruleTokens = new Set(rule.tokens);
+  if (!inputTokens.size || !ruleTokens.size) return 0;
+  let intersection = 0;
+  for (const token of ruleTokens) if (inputTokens.has(token)) intersection += 1;
+  return intersection / ruleTokens.size;
 }
 
 function similarity(left: WeightedTokens, right: WeightedTokens): number {
@@ -183,6 +197,98 @@ function parseProposal(raw: unknown, input: ProjectTabInput[], provider: GroupPr
     analyzedTabCount: input.length,
     createdAt: Date.now(),
   };
+}
+
+export function applyProjectMemory(input: ProjectTabInput[], proposal: GroupProposal, memory: ProjectMemoryRule[]): GroupProposal {
+  if (!memory.length || !input.length) return proposal;
+  const inputById = new Map(input.map((tab) => [tab.tabId, tab]));
+  const candidates = memory
+    .map((rule) => ({ rule, tabIds: input.filter((tab) => memoryMatchScore(tab, rule) >= 0.6).map((tab) => tab.tabId) }))
+    .filter(({ tabIds }) => tabIds.length >= 2)
+    .sort((left, right) => right.tabIds.length - left.tabIds.length || right.rule.updatedAt - left.rule.updatedAt);
+  if (!candidates.length) return proposal;
+
+  const groups = proposal.groups.map((group) => ({ ...group, tabIds: [...group.tabIds], evidence: [...group.evidence] }));
+  const memoryOwner = new Map<number, string>();
+  for (const candidate of candidates) {
+    for (const tabId of candidate.tabIds) {
+      const owner = memoryOwner.get(tabId);
+      if (owner && owner !== candidate.rule.id) memoryOwner.set(tabId, '__conflict__');
+      else memoryOwner.set(tabId, candidate.rule.id);
+    }
+  }
+
+  for (const group of groups) {
+    const conflictTabIds = group.tabIds.filter((tabId) => memoryOwner.get(tabId) === '__conflict__');
+    if (conflictTabIds.length) {
+      group.tabIds = group.tabIds.filter((tabId) => !conflictTabIds.includes(tabId));
+      group.confidence = 'low';
+      group.score = Math.min(group.score, 0.29);
+      group.evidence = [...group.evidence, { label: 'Memory conflict', detail: 'Previous project choices conflict for some tabs.' }].slice(0, 4);
+    }
+  }
+
+  for (const candidate of candidates) {
+    const matchIds = candidate.tabIds.filter((tabId) => memoryOwner.get(tabId) === candidate.rule.id && inputById.has(tabId));
+    if (matchIds.length < 2) continue;
+    const existing = groups.find((group) => matchIds.filter((tabId) => group.tabIds.includes(tabId)).length >= 2);
+    const evidence = { label: 'Previous choice', detail: `Matches the confirmed project “${candidate.rule.projectName}”.` };
+    if (existing) {
+      existing.evidence = [...existing.evidence, evidence].slice(0, 4);
+      existing.score = Math.max(existing.score, 0.72);
+      if (existing.confidence === 'low') existing.confidence = 'medium';
+      continue;
+    }
+    groups.push({
+      name: candidate.rule.projectName,
+      tabIds: matchIds,
+      confidence: 'high',
+      score: 0.72,
+      evidence: [evidence, { label: 'Local memory', detail: 'The rule is stored only on this device.' }],
+    });
+  }
+
+  const used = new Set<number>();
+  const safeGroups = groups
+    .map((group) => ({ ...group, tabIds: group.tabIds.filter((tabId) => inputById.has(tabId) && !used.has(tabId)) }))
+    .filter((group) => group.tabIds.length >= 2)
+    .map((group) => {
+      group.tabIds.forEach((tabId) => used.add(tabId));
+      return group;
+    });
+  return {
+    ...proposal,
+    groups: safeGroups,
+    unclassifiedTabIds: input.filter((tab) => !used.has(tab.tabId)).map((tab) => tab.tabId),
+  };
+}
+
+export function buildProjectMemoryRules(input: ProjectTabInput[], proposal: GroupProposal, existing: ProjectMemoryRule[], now = Date.now()): ProjectMemoryRule[] {
+  const inputById = new Map(input.map((tab) => [tab.tabId, tab]));
+  const next = [...existing];
+  for (const group of proposal.groups) {
+    const groupInputs = group.tabIds.map((tabId) => inputById.get(tabId)).filter((tab): tab is ProjectTabInput => Boolean(tab));
+    if (groupInputs.length < 2) continue;
+    const counts = new Map<string, number>();
+    for (const token of extractProjectTokens({ title: group.name, url: '', summary: '' })) counts.set(token, (counts.get(token) ?? 0) + 5);
+    for (const tab of groupInputs) for (const token of memoryTokensForInput(tab)) counts.set(token, (counts.get(token) ?? 0) + 1);
+    const tokens = [...counts.entries()]
+      .filter(([token]) => !GENERIC_TOKENS.has(token))
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 16)
+      .map(([token]) => token);
+    if (!tokens.length) continue;
+    const existingRule = next.find((rule) => rule.projectName.trim().toLowerCase() === group.name.trim().toLowerCase());
+    if (existingRule) {
+      existingRule.tokens = [...new Set([...existingRule.tokens, ...tokens])].slice(0, 40);
+      existingRule.projectName = group.name.trim().slice(0, 80);
+      existingRule.updatedAt = now;
+      existingRule.useCount += 1;
+    } else {
+      next.push({ id: createId('memory'), projectName: group.name.trim().slice(0, 80), tokens, createdAt: now, updatedAt: now, useCount: 1 });
+    }
+  }
+  return next.sort((left, right) => right.updatedAt - left.updatedAt).slice(0, 100);
 }
 
 function localModelApi(): { create: (options?: Record<string, unknown>) => Promise<{ prompt: (value: string) => Promise<string>; destroy?: () => void }> } | null {

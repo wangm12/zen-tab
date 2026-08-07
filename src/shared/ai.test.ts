@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { createAIProvider, heuristicCleanup } from './ai';
-import { DEFAULT_SETTINGS, ProjectTabInput } from './types';
+import { applyProjectMemory, buildProjectMemoryRules, createAIProvider, heuristicCleanup } from './ai';
+import { DEFAULT_SETTINGS, GroupProposal, ProjectMemoryRule, ProjectTabInput } from './types';
 
 const input: ProjectTabInput[] = [
   { tabId: 1, title: 'Zen Tab performance plan', url: 'https://docs.google.com/document/d/abc', canonicalUrl: 'https://docs.google.com/document/d/abc' },
@@ -9,6 +9,15 @@ const input: ProjectTabInput[] = [
 ];
 
 describe('project grouping fallback', () => {
+  const emptyProposal = (tabIds: number[]): GroupProposal => ({
+    proposalId: 'proposal-test',
+    provider: 'local-heuristic',
+    groups: [],
+    unclassifiedTabIds: tabIds,
+    analyzedTabCount: tabIds.length,
+    createdAt: Date.now(),
+  });
+
   it('groups related work across different domains and leaves unrelated work alone', async () => {
     const provider = createAIProvider(DEFAULT_SETTINGS);
     const proposal = await provider.proposeProjects(input);
@@ -90,5 +99,39 @@ describe('project grouping fallback', () => {
     } finally {
       (globalThis as unknown as { LanguageModel?: unknown }).LanguageModel = original;
     }
+  });
+
+  it('uses confirmed local project memory as a high-confidence grouping signal', () => {
+    const memory: ProjectMemoryRule[] = [{ id: 'memory-1', projectName: 'Zen Tab', tokens: ['zen', 'tab'], createdAt: 1, updatedAt: 2, useCount: 1 }];
+    const proposal = applyProjectMemory(input, emptyProposal(input.map((tab) => tab.tabId)), memory);
+    expect(proposal.groups).toHaveLength(1);
+    expect(proposal.groups[0].name).toBe('Zen Tab');
+    expect(proposal.groups[0].confidence).toBe('high');
+    expect(proposal.groups[0].tabIds).toEqual([1, 2]);
+    expect(proposal.unclassifiedTabIds).toContain(3);
+  });
+
+  it('keeps conflicting memory rules unclassified instead of merging them', () => {
+    const memory: ProjectMemoryRule[] = [
+      { id: 'memory-1', projectName: 'Zen Tab', tokens: ['zen', 'tab'], createdAt: 1, updatedAt: 2, useCount: 1 },
+      { id: 'memory-2', projectName: 'Tab Research', tokens: ['tab', 'research'], createdAt: 1, updatedAt: 3, useCount: 1 },
+    ];
+    const conflictInput = [
+      { tabId: 1, title: 'Zen Tab research', url: 'https://docs.example.com/zen-tab', canonicalUrl: null },
+      { tabId: 2, title: 'Zen Tab research notes', url: 'https://github.com/acme/zen-tab', canonicalUrl: null },
+    ];
+    const proposal = applyProjectMemory(conflictInput, emptyProposal([1, 2]), memory);
+    expect(proposal.groups).toHaveLength(0);
+    expect(proposal.unclassifiedTabIds).toEqual([1, 2]);
+  });
+
+  it('does not learn a single-tab project or unclassified tabs', () => {
+    const memory = buildProjectMemoryRules(input, emptyProposal(input.map((tab) => tab.tabId)), []);
+    expect(memory).toEqual([]);
+    const grouped: GroupProposal = {
+      ...emptyProposal([3]),
+      groups: [{ name: 'Travel', tabIds: [3], confidence: 'high', score: 0.8, evidence: [] }],
+    };
+    expect(buildProjectMemoryRules(input, grouped, [])).toEqual([]);
   });
 });

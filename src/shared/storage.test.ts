@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { listStashes, loadSettings } from './storage';
+import { clearProjectMemory, listStashes, loadProjectMemory, loadSettings, saveProjectMemory } from './storage';
 
 type MockStorage = Record<string, unknown>;
 
@@ -10,7 +10,10 @@ beforeEach(() => {
   (globalThis as unknown as { chrome: unknown }).chrome = {
     storage: {
       local: {
-        get: async (keys: string[]) => Object.fromEntries(keys.filter((key) => key in storage).map((key) => [key, storage[key]])),
+        get: async (keys: string | string[]) => {
+          const requested = Array.isArray(keys) ? keys : [keys];
+          return Object.fromEntries(requested.filter((key) => key in storage).map((key) => [key, storage[key]]));
+        },
         set: async (value: MockStorage) => Object.assign(storage, value),
         remove: async (key: string) => { delete storage[key]; },
       },
@@ -42,5 +45,31 @@ describe('storage validation', () => {
     expect(stashes).toHaveLength(1);
     expect(stashes[0].tabs[0].windowId).toBe(42);
     expect(stashes[0].tabs[0].active).toBe(false);
+  });
+
+  it('falls back safely and bounds normalized project memory', async () => {
+    storage['zen-tab.project-memory'] = [
+      { id: 'valid', projectName: 'A project', tokens: ['A very long token '.repeat(20), 'shared'], createdAt: 1, updatedAt: 2, useCount: 3 },
+      { id: 'invalid', projectName: 'Broken', tokens: 'not-an-array' },
+    ];
+    const rules = await loadProjectMemory();
+    expect(rules).toHaveLength(1);
+    expect(rules[0].tokens).toContain('shared');
+    expect(rules[0].tokens.every((token) => token.length <= 80)).toBe(true);
+  });
+
+  it('limits project memory rules and can clear them', async () => {
+    const rules = Array.from({ length: 120 }, (_, index) => ({
+      id: `rule-${index}`,
+      projectName: `Project ${index}`,
+      tokens: [`project-${index}`, 'context'],
+      createdAt: index,
+      updatedAt: index,
+      useCount: 1,
+    }));
+    await saveProjectMemory(rules);
+    expect((await loadProjectMemory())).toHaveLength(100);
+    await clearProjectMemory();
+    expect(await loadProjectMemory()).toEqual([]);
   });
 });

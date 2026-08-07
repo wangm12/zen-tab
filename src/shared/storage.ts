@@ -3,6 +3,7 @@ import {
   DEFAULT_SETTINGS,
   StashRecord,
   StashedTab,
+  ProjectMemoryRule,
   ZenTabSettings,
 } from './types';
 
@@ -14,6 +15,10 @@ const LEGACY_SETTINGS_KEY = 'tab-flow.settings';
 const LEGACY_STASHES_KEY = 'tab-flow.stashes';
 const LEGACY_ACTION_KEY = 'tab-flow.last-action';
 const LEGACY_GROQ_KEY = 'tab-flow.groq-key';
+const PROJECT_MEMORY_KEY = 'zen-tab.project-memory';
+const MAX_PROJECT_MEMORY_RULES = 100;
+const MAX_PROJECT_MEMORY_TOKEN_LENGTH = 80;
+const MAX_PROJECT_MEMORY_JSON_LENGTH = 1_000_000;
 
 async function readStorageKey<T>(key: string, legacyKey: string): Promise<T | undefined> {
   const result = await chrome.storage.local.get([key, legacyKey]);
@@ -81,6 +86,28 @@ function isActionJournal(value: unknown): value is ActionJournal {
     && typeof value.expiresAt === 'number';
 }
 
+function normalizeProjectMemory(value: unknown): ProjectMemoryRule[] {
+  if (!Array.isArray(value)) return [];
+  const rules = value.flatMap((item): ProjectMemoryRule[] => {
+    if (!isRecord(item) || typeof item.id !== 'string' || typeof item.projectName !== 'string' || !Array.isArray(item.tokens)) return [];
+    const projectName = item.projectName.trim().slice(0, 80);
+    const tokens = [...new Set(item.tokens
+      .filter((token): token is string => typeof token === 'string')
+      .map((token) => token.trim().toLowerCase().slice(0, MAX_PROJECT_MEMORY_TOKEN_LENGTH))
+      .filter(Boolean))].slice(0, 40);
+    if (!projectName || !tokens.length) return [];
+    return [{
+      id: item.id,
+      projectName,
+      tokens,
+      createdAt: typeof item.createdAt === 'number' && Number.isFinite(item.createdAt) ? item.createdAt : Date.now(),
+      updatedAt: typeof item.updatedAt === 'number' && Number.isFinite(item.updatedAt) ? item.updatedAt : Date.now(),
+      useCount: typeof item.useCount === 'number' && Number.isFinite(item.useCount) ? Math.max(0, Math.floor(item.useCount)) : 0,
+    }];
+  });
+  return rules.sort((left, right) => right.updatedAt - left.updatedAt).slice(0, MAX_PROJECT_MEMORY_RULES);
+}
+
 export async function loadSettings(): Promise<ZenTabSettings> {
   const stored = await readStorageKey<unknown>(SETTINGS_KEY, LEGACY_SETTINGS_KEY);
   const safeSettings = isRecord(stored) ? stored : {};
@@ -115,7 +142,7 @@ export async function saveGroqApiKey(apiKey: string): Promise<void> {
 
 export async function listStashes(): Promise<StashRecord[]> {
   const stored = await readStorageKey<unknown>(STASHES_KEY, LEGACY_STASHES_KEY);
-  return Array.isArray(stored) ? stored.map(normalizeStash).filter((stash): stash is StashRecord => Boolean(stash)) : [];
+  return Array.isArray(stored) ? stored.map(normalizeStash).filter((stash): stash is StashRecord => Boolean(stash)).slice(0, 50) : [];
 }
 
 export async function saveStash(stash: StashRecord): Promise<void> {
@@ -126,6 +153,19 @@ export async function saveStash(stash: StashRecord): Promise<void> {
   if (!verify.some((item) => item.id === stash.id)) throw new Error('Stash could not be persisted.');
 }
 
+export async function updateStash(stashId: string, update: (stash: StashRecord) => StashRecord): Promise<StashRecord> {
+  const stashes = await listStashes();
+  const current = stashes.find((stash) => stash.id === stashId);
+  if (!current) throw new Error('Stash not found.');
+  const updated = update(current);
+  const next = stashes.map((stash) => stash.id === stashId ? updated : stash);
+  await chrome.storage.local.set({ [STASHES_KEY]: next });
+  const verify = await listStashes();
+  const persisted = verify.find((stash) => stash.id === stashId);
+  if (!persisted) throw new Error('Stash could not be persisted.');
+  return persisted;
+}
+
 export async function deleteStash(stashId: string): Promise<void> {
   const stashes = await listStashes();
   await chrome.storage.local.set({ [STASHES_KEY]: stashes.filter((stash) => stash.id !== stashId) });
@@ -133,6 +173,23 @@ export async function deleteStash(stashId: string): Promise<void> {
 
 export async function getStash(stashId: string): Promise<StashRecord | undefined> {
   return (await listStashes()).find((stash) => stash.id === stashId);
+}
+
+export async function loadProjectMemory(): Promise<ProjectMemoryRule[]> {
+  const result = await chrome.storage.local.get(PROJECT_MEMORY_KEY);
+  const normalized = normalizeProjectMemory(result[PROJECT_MEMORY_KEY]);
+  return JSON.stringify(normalized).length <= MAX_PROJECT_MEMORY_JSON_LENGTH ? normalized : [];
+}
+
+export async function saveProjectMemory(rules: ProjectMemoryRule[]): Promise<void> {
+  const normalized = normalizeProjectMemory(rules);
+  const serialized = JSON.stringify(normalized);
+  if (serialized.length > MAX_PROJECT_MEMORY_JSON_LENGTH) throw new Error('Project memory is too large.');
+  await chrome.storage.local.set({ [PROJECT_MEMORY_KEY]: normalized });
+}
+
+export async function clearProjectMemory(): Promise<void> {
+  await chrome.storage.local.remove(PROJECT_MEMORY_KEY);
 }
 
 export async function saveLastAction(action: ActionJournal): Promise<void> {

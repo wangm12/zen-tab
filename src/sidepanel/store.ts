@@ -22,6 +22,7 @@ type ZenTabStore = {
   groupProposal: GroupProposal | null;
   cleanupProposal: CleanupProposal | null;
   groupScanProgress: GroupScanProgress | null;
+  restoreProgress: Extract<ZenTabEvent, { type: 'RESTORE_PROGRESS' }> | null;
   busy: string | null;
   toast: ToastMessage | null;
   error: string | null;
@@ -47,6 +48,7 @@ export const useZenTabStore = create<ZenTabStore>((set, get) => ({
   groupProposal: null,
   cleanupProposal: null,
   groupScanProgress: null,
+  restoreProgress: null,
   busy: null,
   toast: null,
   error: null,
@@ -74,6 +76,7 @@ export const useZenTabStore = create<ZenTabStore>((set, get) => ({
     }
     if (event.type === 'TOAST') set({ toast: event.toast });
     if (event.type === 'GROUP_SCAN_PROGRESS') set({ groupScanProgress: event });
+    if (event.type === 'RESTORE_PROGRESS') set({ restoreProgress: event });
   },
   async request<T>(message: ZenTabMessage) {
     const response = await chrome.runtime.sendMessage({ ...message }) as { ok: boolean; data?: T; error?: string };
