@@ -1,5 +1,8 @@
-import { buildProjectMemoryRules, createAIProvider, heuristicCleanup } from '../shared/ai';
+import { buildProjectMemoryRules, cloudProposalForSidePanel, createAIProvider, heuristicCleanup } from '../shared/ai';
+import { shouldAutoDiscard, shouldSkipDiscardAfterInspect } from '../shared/discard';
 import { createId } from '../shared/ids';
+import { hostPermissionForBaseUrl } from '../shared/openai';
+import { extractGroupingPageTextInPage } from '../shared/page-text';
 import { canonicalizeUrl, displayHostname, getHostname, isLocalAddress, isSpecialUrl } from '../shared/url';
 import {
   ActionJournal,
@@ -18,6 +21,7 @@ import {
   GroupUndoData,
   ProjectMemoryRule,
   TabRestoreDescriptor,
+  RecentSession,
 } from '../shared/types';
 import {
   clearLastAction,
@@ -59,13 +63,14 @@ type DuplicateUndoData = {
   };
 };
 
+const AUTO_DISCARD_ALARM = 'zen-tab-auto-discard';
 let settings: ZenTabSettings = DEFAULT_SETTINGS;
 let lastAction: ActionJournal | undefined;
 let initialized = false;
 let initializing: Promise<void> | undefined;
 let broadcastTimer: ReturnType<typeof setTimeout> | undefined;
 let focusedWindowId: number = chrome.windows.WINDOW_ID_NONE;
-let groqApiKey = '';
+let cloudApiKey = '';
 let stashesCache: StashRecord[] = [];
 let projectMemory: ProjectMemoryRule[] = [];
 let snapshotCache: ZenTabSnapshot | undefined;
@@ -152,7 +157,7 @@ async function initialize(): Promise<void> {
     lastAction = await loadLastAction();
     stashesCache = await listStashes();
     projectMemory = await loadProjectMemory();
-    groqApiKey = await loadGroqApiKey();
+    cloudApiKey = await loadGroqApiKey();
     try {
       focusedWindowId = (await chrome.windows.getLastFocused()).id ?? chrome.windows.WINDOW_ID_NONE;
     } catch {
@@ -183,6 +188,7 @@ async function initialize(): Promise<void> {
     }
     initialized = true;
     snapshotDirty = true;
+    await syncAutoDiscardAlarm();
     if (focusedWindowId !== chrome.windows.WINDOW_ID_NONE) void hydrateRemainingWindows();
   })();
   await initializing;
@@ -236,7 +242,7 @@ async function buildSnapshot(): Promise<ZenTabSnapshot> {
       stashes: stashesCache,
       projectMemory,
       settings,
-      hasGroqApiKey: Boolean(groqApiKey),
+      hasCloudApiKey: Boolean(cloudApiKey),
       lastAction,
     };
     snapshotDirty = false;
@@ -416,12 +422,15 @@ async function prepareGroupInputs(windowId: number, deepScanAll: boolean): Promi
     .sort((left, right) => left.index - right.index);
   const inputs = eligible.map((tab) => createTabInput(tab));
   const finalize = async (preparedInputs: ProjectTabInput[], deepAnalysisUsed: boolean) => {
-    if (settings.aiProvider !== 'groq' || !groqApiKey) return { inputs: preparedInputs, deepAnalysisUsed };
-    const proposal = await createAIProvider(settings, groqApiKey).proposeProjects(preparedInputs);
+    if (settings.aiProvider !== 'openai-compatible' || !cloudApiKey) return { inputs: preparedInputs, deepAnalysisUsed };
+    const proposal = await createAIProvider(settings, cloudApiKey).proposeProjects(preparedInputs);
+    const cloudProposal = cloudProposalForSidePanel(proposal);
     return {
       inputs: preparedInputs,
       deepAnalysisUsed,
-      proposal: { ...proposal, sourceWindowId: windowId, analyzedTabIds: preparedInputs.map((input) => input.tabId) },
+      ...(cloudProposal
+        ? { proposal: { ...cloudProposal, sourceWindowId: windowId, analyzedTabIds: preparedInputs.map((input) => input.tabId) } }
+        : {}),
     };
   };
   const fullScan = deepScanAll && settings.deepAnalysisEnabled;
@@ -461,7 +470,7 @@ async function prepareGroupInputs(windowId: number, deepScanAll: boolean): Promi
       try {
         const result = await chrome.scripting.executeScript({
           target: { tabId: input.tabId },
-          func: () => (document.body?.innerText ?? '').replace(/\s+/g, ' ').trim().slice(0, 900),
+          func: extractGroupingPageTextInPage,
         });
         const summary = result[0]?.result;
         if (typeof summary === 'string' && summary) withSummaries.set(input.tabId, summary);
@@ -537,17 +546,19 @@ async function applyGroupProposal(proposal: GroupProposal): Promise<{ groupsCrea
   return { groupsCreated: validatedGroups.length };
 }
 
-async function updateGroup(groupId: number, action: 'rename' | 'color', title?: string, color?: TabGroupRecord['color']): Promise<{ updated: true }> {
+async function updateGroup(groupId: number, action: 'rename' | 'color' | 'collapse', title?: string, color?: TabGroupRecord['color'], collapsed?: boolean): Promise<{ updated: true }> {
   const group = groupIndex.get(groupId);
   if (!group) throw new Error('That tab group is no longer available.');
   if (action === 'rename') {
     const rawTitle = (title ?? '').trim();
     if (rawTitle.length > 42) throw new Error('Group names must be 42 characters or fewer.');
-    const nextTitle = rawTitle;
-    await chrome.tabGroups.update(groupId, { title: nextTitle });
-  } else {
+    await chrome.tabGroups.update(groupId, { title: rawTitle });
+  } else if (action === 'color') {
     if (!color) throw new Error('A tab group color is required.');
     await chrome.tabGroups.update(groupId, { color });
+  } else {
+    await chrome.tabGroups.update(groupId, { collapsed: Boolean(collapsed) });
+    return { updated: true };
   }
   await persistAction({
     actionId: createId('action'),
@@ -582,7 +593,7 @@ async function buildCleanupProposal(windowId: number): Promise<CleanupProposal> 
   const tabs = [...tabIndex.values()].filter((tab) => tab.windowId === windowId && (settings.incognitoEnabled || !tab.incognito) && !tab.pinned && !tab.active && !tab.audible && !isSpecialUrl(tab.url));
   const inputs = tabs.map((tab) => createTabInput(tab));
   const ruleCandidates = heuristicCleanup(inputs, settings.protectedDomains);
-  const aiKey = await hasGroqPermission() ? groqApiKey : '';
+  const aiKey = await hasCloudPermission() ? cloudApiKey : '';
   const aiCandidates = await createAIProvider(settings, aiKey).proposeCleanup(inputs, settings.protectedDomains);
   const rawByTabId = new Map(ruleCandidates.map((candidate) => [candidate.tabId, candidate]));
   aiCandidates.forEach((candidate) => { if (!rawByTabId.has(candidate.tabId)) rawByTabId.set(candidate.tabId, candidate); });
@@ -638,12 +649,66 @@ async function hasPageSafetyPermission(): Promise<boolean> {
   }
 }
 
-async function hasGroqPermission(): Promise<boolean> {
+async function hasCloudPermission(): Promise<boolean> {
+  const origin = hostPermissionForBaseUrl(settings.openaiBaseUrl);
+  if (!origin) return false;
   try {
-    return await chrome.permissions.contains({ origins: ['https://api.groq.com/*'] });
+    return await chrome.permissions.contains({ origins: [origin] });
   } catch {
     return false;
   }
+}
+
+async function syncAutoDiscardAlarm(): Promise<void> {
+  try {
+    if (settings.autoDiscardEnabled) await chrome.alarms.create(AUTO_DISCARD_ALARM, { periodInMinutes: 1 });
+    else await chrome.alarms.clear(AUTO_DISCARD_ALARM);
+  } catch {
+    /* alarms permission may be missing in older builds */
+  }
+}
+
+async function runAutoDiscard(): Promise<void> {
+  if (!settings.autoDiscardEnabled) return;
+  const now = Date.now();
+  const inspectEnabled = settings.autoDiscardInspectPages;
+  const hasPermission = inspectEnabled ? await hasPageSafetyPermission() : false;
+  for (const tab of tabIndex.values()) {
+    if (!shouldAutoDiscard(tab, settings, now)) continue;
+    let inspectProtected = true;
+    if (inspectEnabled && hasPermission) inspectProtected = (await inspectCleanupSafety(tab.tabId)).protected;
+    if (shouldSkipDiscardAfterInspect({ inspectEnabled, hasPermission, inspectProtected })) continue;
+    try {
+      await chrome.tabs.discard(tab.tabId);
+    } catch {
+      /* tab may have closed or already been discarded */
+    }
+  }
+}
+
+async function importStashes(incoming: StashRecord[]): Promise<{ imported: number }> {
+  let imported = 0;
+  for (const stash of incoming) {
+    if (!stash.tabs.length) continue;
+    await saveStash(stash);
+    imported += 1;
+  }
+  stashesCache = await listStashes();
+  return { imported };
+}
+
+async function listRecentSessions(): Promise<RecentSession[]> {
+  const sessions = await chrome.sessions.getRecentlyClosed({ maxResults: 25 });
+  return sessions.flatMap((session): RecentSession[] => {
+    const sessionId = session.window?.sessionId ?? session.tab?.sessionId;
+    if (!sessionId) return [];
+    if (session.window) {
+      const tabs = session.window.tabs ?? [];
+      const title = session.window.tabs?.find((tab) => tab.active)?.title || tabs[0]?.title || 'Closed window';
+      return [{ sessionId, lastModified: session.lastModified ?? 0, title, tabCount: tabs.length, kind: 'window' }];
+    }
+    return [{ sessionId, lastModified: session.lastModified ?? 0, title: session.tab?.title || session.tab?.url || 'Closed tab', tabCount: 1, kind: 'tab' }];
+  });
 }
 
 async function inspectCleanupSafety(tabId: number): Promise<{ protected: boolean; evidence: string[] }> {
@@ -1062,17 +1127,25 @@ async function handleMessage(message: ZenTabMessage): Promise<unknown> {
       return { cleared: true };
     case 'UPDATE_SETTINGS':
       settings = { ...settings, ...message.patch };
-      if (message.patch.aiProvider && message.patch.aiProvider !== 'groq') {
-        groqApiKey = '';
+      if (message.patch.aiProvider && message.patch.aiProvider !== 'openai-compatible') {
+        cloudApiKey = '';
         await saveGroqApiKey('');
       }
       await saveSettings(settings);
+      await syncAutoDiscardAlarm();
       return settings;
-    case 'UPDATE_GROQ_KEY':
-      if (message.apiKey.length > 512) throw new Error('The Groq API key is too long.');
-      groqApiKey = message.apiKey.trim();
-      await saveGroqApiKey(groqApiKey);
-      return { configured: Boolean(groqApiKey) };
+    case 'UPDATE_CLOUD_KEY':
+      if (message.apiKey.length > 512) throw new Error('The API key is too long.');
+      cloudApiKey = message.apiKey.trim();
+      await saveGroqApiKey(cloudApiKey);
+      return { configured: Boolean(cloudApiKey) };
+    case 'IMPORT_STASHES':
+      return importStashes(message.stashes);
+    case 'LIST_RECENT_SESSIONS':
+      return listRecentSessions();
+    case 'RESTORE_SESSION':
+      await chrome.sessions.restore(message.sessionId);
+      return { restored: true };
     case 'CLOSE_TABS':
       return { closed: await closeTabsWithJournal([...new Set(message.tabIds)], 'cleanup') };
     case 'MOVE_TAB':
@@ -1083,7 +1156,7 @@ async function handleMessage(message: ZenTabMessage): Promise<unknown> {
       if (message.groupId !== -1) await chrome.tabs.group({ tabIds: [message.tabId], groupId: message.groupId });
       return { grouped: true };
     case 'UPDATE_GROUP':
-      return updateGroup(message.groupId, message.action, message.title, message.color);
+      return updateGroup(message.groupId, message.action, message.title, message.color, message.collapsed);
     case 'UNGROUP_GROUP':
       return ungroupGroup(message.groupId);
     case 'UPDATE_TAB':
@@ -1117,7 +1190,9 @@ function isMutationMessage(message: ZenTabMessage): boolean {
     || message.type === 'UNDO_ACTION'
     || message.type === 'CLEAR_PROJECT_MEMORY'
     || message.type === 'UPDATE_SETTINGS'
-    || message.type === 'UPDATE_GROQ_KEY'
+    || message.type === 'UPDATE_CLOUD_KEY'
+    || message.type === 'IMPORT_STASHES'
+    || message.type === 'RESTORE_SESSION'
     || message.type === 'CLOSE_TABS'
     || message.type === 'MOVE_TAB'
     || message.type === 'GROUP_TAB'
@@ -1236,6 +1311,11 @@ chrome.runtime.onStartup.addListener(() => {
 chrome.runtime.onInstalled.addListener(() => {
   void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);
   void initialize();
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== AUTO_DISCARD_ALARM) return;
+  void initialize().then(() => runAutoDiscard()).catch(() => undefined);
 });
 
 void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => undefined);

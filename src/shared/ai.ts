@@ -1,9 +1,11 @@
 import { createId } from './ids';
-import { extractProjectTokens } from './url';
+import { extractProjectTokens, hostTokensFromUrl } from './url';
+import { chatCompletionsUrl, DEFAULT_OPENAI_MODEL } from './openai';
 import {
   AIProvider,
   CleanupCandidate,
   GroupProposal,
+  Language,
   ProjectGroupProposal,
   ProjectMemoryRule,
   ProjectTabInput,
@@ -21,16 +23,33 @@ const AI_BATCH_SIZE = 40;
 const AI_TIMEOUT_MS = 20_000;
 const AI_TOTAL_BUDGET_MS = 30_000;
 
+const HOST_TOKEN_WEIGHT = 0.25;
+
+function hostTokensFor(input: ProjectTabInput): Set<string> {
+  return hostTokensFromUrl(input.url);
+}
+
 function weightedTokens(input: ProjectTabInput): WeightedTokens {
   const titleTokens = extractProjectTokens({ title: input.title, url: '', summary: '' });
   const urlTokens = extractProjectTokens({ title: '', url: input.url, summary: '' });
   const summaryTokens = extractProjectTokens({ title: '', url: '', summary: input.summary });
+  const hostTokens = hostTokensFor(input);
   const weights = new Map<string, number>();
-  for (const token of titleTokens) weights.set(token, (weights.get(token) ?? 0) + 3);
-  for (const token of urlTokens) weights.set(token, (weights.get(token) ?? 0) + 1);
-  for (const token of summaryTokens) weights.set(token, (weights.get(token) ?? 0) + 2);
+  const add = (tokens: string[], weight: number) => {
+    for (const token of tokens) {
+      const bump = hostTokens.has(token) ? HOST_TOKEN_WEIGHT : weight;
+      weights.set(token, (weights.get(token) ?? 0) + bump);
+    }
+  };
+  add(titleTokens, 3);
+  add(urlTokens, 1);
+  add(summaryTokens, 2);
   for (const token of GENERIC_TOKENS) weights.delete(token);
   return weights;
+}
+
+function distinctiveSharedTokens(left: WeightedTokens, right: WeightedTokens, hostTokens: Set<string>): string[] {
+  return [...left.keys()].filter((token) => right.has(token) && !hostTokens.has(token));
 }
 
 function memoryTokensForInput(input: ProjectTabInput): Set<string> {
@@ -90,8 +109,9 @@ function proposalFromHeuristics(input: ProjectTabInput[]): GroupProposal {
   for (let left = 0; left < input.length; left += 1) {
     for (let right = left + 1; right < input.length; right += 1) {
       const score = similarity(weighted[left], weighted[right]);
-      const shared = [...weighted[left].keys()].filter((token) => weighted[right].has(token));
-      if (shared.length > 0 && score >= 0.26) union(left, right);
+      const hostTokens = new Set([...hostTokensFor(input[left]), ...hostTokensFor(input[right])]);
+      const distinctive = distinctiveSharedTokens(weighted[left], weighted[right], hostTokens);
+      if (distinctive.length >= 2 && score >= 0.26) union(left, right);
     }
   }
 
@@ -106,9 +126,13 @@ function proposalFromHeuristics(input: ProjectTabInput[]): GroupProposal {
 
   for (const indices of clusters.values()) {
     if (indices.length < 2) continue;
+    const clusterHostTokens = new Set(indices.flatMap((index) => [...hostTokensFor(input[index])]));
     const tokenCounts = new Map<string, number>();
     for (const index of indices) {
-      for (const [token, weight] of weighted[index]) tokenCounts.set(token, (tokenCounts.get(token) ?? 0) + weight);
+      for (const [token, weight] of weighted[index]) {
+        if (clusterHostTokens.has(token)) continue;
+        tokenCounts.set(token, (tokenCounts.get(token) ?? 0) + weight);
+      }
     }
     const topTokens = [...tokenCounts.entries()]
       .sort((a, b) => b[1] - a[1])
@@ -129,15 +153,17 @@ function proposalFromHeuristics(input: ProjectTabInput[]): GroupProposal {
     if (confidence === 'low') continue;
 
     indices.forEach((index) => grouped.add(index));
+    const sharedHost = [...clusterHostTokens].filter((token) => indices.every((index) => hostTokensFor(input[index]).has(token)));
+    const evidence = [{ label: 'Shared context', detail: topTokens.map(humanizeToken).join(', ') }];
+    if (sharedHost.length) {
+      evidence.push({ label: 'Same site', detail: `${sharedHost.map(humanizeToken).join(', ')} was a weak hostname signal, not the project name.` });
+    }
     groups.push({
       name: topTokens.map(humanizeToken).join(' / '),
       tabIds: indices.map((index) => input[index].tabId),
       confidence,
       score,
-      evidence: [
-        { label: 'Shared context', detail: topTokens.map(humanizeToken).join(', ') },
-        { label: 'Cross-site safe', detail: 'Domain was treated as a weak signal, not a grouping boundary.' },
-      ],
+      evidence,
     });
   }
 
@@ -234,6 +260,7 @@ export function applyProjectMemory(input: ProjectTabInput[], proposal: GroupProp
     const existing = groups.find((group) => matchIds.filter((tabId) => group.tabIds.includes(tabId)).length >= 2);
     const evidence = { label: 'Previous choice', detail: `Matches the confirmed project “${candidate.rule.projectName}”.` };
     if (existing) {
+      existing.tabIds = [...new Set([...existing.tabIds, ...matchIds])];
       existing.evidence = [...existing.evidence, evidence].slice(0, 4);
       existing.score = Math.max(existing.score, 0.72);
       if (existing.confidence === 'low') existing.confidence = 'medium';
@@ -291,12 +318,51 @@ export function buildProjectMemoryRules(input: ProjectTabInput[], proposal: Grou
   return next.sort((left, right) => right.updatedAt - left.updatedAt).slice(0, 100);
 }
 
-function localModelApi(): { create: (options?: Record<string, unknown>) => Promise<{ prompt: (value: string) => Promise<string>; destroy?: () => void }> } | null {
+type DownloadMonitor = {
+  addEventListener: (type: string, listener: (event: { loaded?: number; total?: number }) => void) => void;
+};
+
+export type DownloadProgressHandler = (percent: number) => void;
+
+type LocalModelSession = { prompt: (value: string, options?: { signal?: AbortSignal }) => Promise<string>; destroy?: () => void };
+type LocalModelApi = {
+  create: (options?: { monitor?: (monitor: DownloadMonitor) => void; signal?: AbortSignal } & Record<string, unknown>) => Promise<LocalModelSession>;
+  availability?: () => Promise<string>;
+};
+
+function localModelApi(): LocalModelApi | null {
   const globalObject = globalThis as unknown as {
-    LanguageModel?: { create: (options?: Record<string, unknown>) => Promise<{ prompt: (value: string) => Promise<string>; destroy?: () => void }> };
-    ai?: { languageModel?: { create: (options?: Record<string, unknown>) => Promise<{ prompt: (value: string) => Promise<string>; destroy?: () => void }> } };
+    LanguageModel?: LocalModelApi;
+    ai?: { languageModel?: LocalModelApi };
   };
   return globalObject.LanguageModel?.create ? globalObject.LanguageModel : globalObject.ai?.languageModel?.create ? globalObject.ai.languageModel : null;
+}
+
+export function downloadProgressPercent(loaded: number, total?: number): number {
+  if (typeof total === 'number' && Number.isFinite(total) && total > 0) {
+    return Math.max(0, Math.min(100, Math.round((loaded / total) * 100)));
+  }
+  if (loaded >= 0 && loaded <= 1) return Math.round(loaded * 100);
+  return Math.max(0, Math.min(100, Math.round(loaded)));
+}
+
+function withDownloadMonitor(onProgress?: DownloadProgressHandler): ((monitor: DownloadMonitor) => void) | undefined {
+  if (!onProgress) return undefined;
+  return (monitor) => {
+    monitor.addEventListener('downloadprogress', (event) => {
+      onProgress(downloadProgressPercent(Number(event.loaded) || 0, typeof event.total === 'number' ? event.total : undefined));
+    });
+  };
+}
+
+export async function ensureBuiltInLanguageModel(onProgress?: DownloadProgressHandler, signal?: AbortSignal): Promise<LocalModelSession> {
+  const api = localModelApi();
+  if (!api) throw new Error('Built-in language model is not supported.');
+  return api.create({ monitor: withDownloadMonitor(onProgress), signal });
+}
+
+export function isAbortError(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && 'name' in error && (error as { name: string }).name === 'AbortError');
 }
 
 function cleanJsonResult(result: string): unknown {
@@ -317,13 +383,31 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   }
 }
 
-function batchPrompt(input: ProjectTabInput[]): string {
-  return [
-    'Group browser tabs into work projects. Do not group by domain alone: the same site can belong to different projects.',
-    'Use shared task nouns, repository names, issue IDs, product names, and page context. Keep uncertain tabs unclassified.',
-    'Return JSON only: {"groups":[{"name":"...","tabIds":[1,2],"confidence":"high|medium|low","score":0.0,"evidence":[{"label":"...","detail":"..."}]}],"unclassifiedTabIds":[3]}',
-    JSON.stringify(input.map(({ tabId, title, url, summary }) => ({ tabId, title, url, summary }))),
-  ].join('\n');
+export function batchPrompt(input: ProjectTabInput[], language: Language = 'en'): string {
+  const instructions = language === 'zh'
+    ? [
+        '按工作项目给浏览器标签分组。不要按网站分组。同一网站可以属于不同项目。',
+        '使用 title、host、path 和 summary。组名用项目词，不要用网站名。不确定的标签保持未分类。',
+        '只返回 JSON：{"groups":[{"name":"...","tabIds":[1,2],"confidence":"high|medium|low","score":0.0,"evidence":[{"label":"...","detail":"..."}]}],"unclassifiedTabIds":[3]}',
+      ]
+    : [
+        'Group browser tabs into work projects. Do not group by website. The same site can belong to different projects.',
+        'Use title, host, path, and summary. Name groups from the project, not the host. Keep uncertain tabs unclassified.',
+        'Return JSON only: {"groups":[{"name":"...","tabIds":[1,2],"confidence":"high|medium|low","score":0.0,"evidence":[{"label":"...","detail":"..."}]}],"unclassifiedTabIds":[3]}',
+      ];
+  const tabs = input.map((tab) => {
+    let host = '';
+    let path = '';
+    try {
+      const parsed = new URL(tab.url);
+      host = parsed.hostname;
+      path = parsed.pathname;
+    } catch {
+      host = tab.url;
+    }
+    return { tabId: tab.tabId, title: tab.title, host, path, summary: tab.summary };
+  });
+  return [...instructions, JSON.stringify(tabs)].join('\n');
 }
 
 function cleanupPrompt(input: ProjectTabInput[], protectedDomains: string[]): string {
@@ -351,25 +435,25 @@ async function requestLocalJson(prompt: string, systemPrompt = 'You are a precis
   }
 }
 
-async function requestLocalModel(input: ProjectTabInput[]): Promise<GroupProposal | null> {
-  const raw = await requestLocalJson(batchPrompt(input));
+async function requestLocalModel(input: ProjectTabInput[], language: Language): Promise<GroupProposal | null> {
+  const raw = await requestLocalJson(batchPrompt(input, language));
   return raw ? parseProposal(raw, input, 'local-model') : null;
 }
 
-async function requestGroqJson(prompt: string, settings: ZenTabSettings, groqApiKey: string, systemPrompt = 'You are a careful browser project classifier.'): Promise<unknown | null> {
-  if (!groqApiKey) return null;
+async function requestCloudJson(prompt: string, settings: ZenTabSettings, apiKey: string, systemPrompt = 'You are a careful browser project classifier.'): Promise<unknown | null> {
+  if (!apiKey) return null;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
   try {
-    const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const response = await fetch(chatCompletionsUrl(settings.openaiBaseUrl), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${groqApiKey}`,
+        Authorization: `Bearer ${apiKey}`,
       },
       signal: controller.signal,
       body: JSON.stringify({
-        model: settings.groqModel || 'llama-3.3-70b-versatile',
+        model: settings.openaiModel || DEFAULT_OPENAI_MODEL,
         temperature: 0.1,
         response_format: { type: 'json_object' },
         messages: [
@@ -390,14 +474,13 @@ async function requestGroqJson(prompt: string, settings: ZenTabSettings, groqApi
   }
 }
 
-async function requestGroq(input: ProjectTabInput[], settings: ZenTabSettings, groqApiKey: string): Promise<GroupProposal | null> {
-  const prompt = [
-    'Classify these browser tabs into project contexts. Same domains can belong to different projects.',
-    'Prefer high precision. Leave ambiguous tabs unclassified. Respond with JSON only using groups, name, tabIds, confidence, score, evidence, and unclassifiedTabIds.',
-    batchPrompt(input),
-  ].join('\n');
-  const raw = await requestGroqJson(prompt, settings, groqApiKey);
-  return raw ? parseProposal(raw, input, 'groq') : null;
+async function requestCloud(input: ProjectTabInput[], settings: ZenTabSettings, apiKey: string): Promise<GroupProposal | null> {
+  const raw = await requestCloudJson(batchPrompt(input, settings.language), settings, apiKey);
+  return raw ? parseProposal(raw, input, 'openai-compatible') : null;
+}
+
+export function cloudProposalForSidePanel(proposal: GroupProposal): GroupProposal | undefined {
+  return proposal.provider === 'openai-compatible' ? proposal : undefined;
 }
 
 function chunks<T>(items: T[], size: number): T[][] {
@@ -406,7 +489,7 @@ function chunks<T>(items: T[], size: number): T[][] {
   return result;
 }
 
-function deterministicMerge(input: ProjectTabInput[], proposals: GroupProposal[], provider: GroupProposal['provider']): GroupProposal {
+export function deterministicMerge(input: ProjectTabInput[], proposals: GroupProposal[], provider: GroupProposal['provider']): GroupProposal {
   const groups: ProjectGroupProposal[] = [];
   const used = new Set<number>();
   for (const proposal of proposals) {
@@ -414,7 +497,7 @@ function deterministicMerge(input: ProjectTabInput[], proposals: GroupProposal[]
       const groupTokens = new Set(extractProjectTokens({ title: group.name, url: '', summary: '' }));
       const matching = groups.find((existing) => {
         const existingTokens = extractProjectTokens({ title: existing.name, url: '', summary: '' });
-        return existingTokens.some((token) => groupTokens.has(token));
+        return existingTokens.filter((token) => groupTokens.has(token)).length >= 2;
       });
       if (matching) {
         matching.tabIds = [...new Set([...matching.tabIds, ...group.tabIds])];
@@ -439,12 +522,12 @@ function deterministicMerge(input: ProjectTabInput[], proposals: GroupProposal[]
   };
 }
 
-async function proposeInBatches(input: ProjectTabInput[], mode: 'local-model' | 'groq', settings: ZenTabSettings, groqApiKey: string): Promise<GroupProposal | null> {
+async function proposeInBatches(input: ProjectTabInput[], mode: 'local-model' | 'openai-compatible', settings: ZenTabSettings, apiKey: string): Promise<GroupProposal | null> {
   const proposals: GroupProposal[] = [];
   const deadline = Date.now() + AI_TOTAL_BUDGET_MS;
   for (const batch of chunks(input, AI_BATCH_SIZE)) {
     if (Date.now() >= deadline) break;
-    const proposal = mode === 'groq' ? await requestGroq(batch, settings, groqApiKey) : await requestLocalModel(batch);
+    const proposal = mode === 'openai-compatible' ? await requestCloud(batch, settings, apiKey) : await requestLocalModel(batch, settings.language);
     if (proposal) proposals.push(proposal);
   }
   if (!proposals.length) return null;
@@ -463,8 +546,8 @@ async function proposeInBatches(input: ProjectTabInput[], mode: 'local-model' | 
     JSON.stringify(proposals.flatMap((proposal) => proposal.groups.map((group) => ({ name: group.name, tabIds: group.tabIds, confidence: group.confidence, score: group.score, evidence: group.evidence })))),
   ].join('\n');
   const raw = Date.now() < deadline
-    ? mode === 'groq'
-      ? await requestGroqJson(candidatePrompt, settings, groqApiKey)
+    ? mode === 'openai-compatible'
+      ? await requestCloudJson(candidatePrompt, settings, apiKey)
       : await requestLocalJson(candidatePrompt)
     : null;
   if (raw) {
@@ -502,14 +585,14 @@ function parseCleanupCandidates(raw: unknown, input: ProjectTabInput[], protecte
   });
 }
 
-async function proposeCleanupInBatches(input: ProjectTabInput[], protectedDomains: string[], mode: 'local-model' | 'groq', settings: ZenTabSettings, groqApiKey: string): Promise<CleanupCandidate[]> {
+async function proposeCleanupInBatches(input: ProjectTabInput[], protectedDomains: string[], mode: 'local-model' | 'openai-compatible', settings: ZenTabSettings, apiKey: string): Promise<CleanupCandidate[]> {
   const candidates: CleanupCandidate[] = [];
   const deadline = Date.now() + AI_TOTAL_BUDGET_MS;
   for (const batch of chunks(input, AI_BATCH_SIZE)) {
     if (Date.now() >= deadline) break;
     const prompt = cleanupPrompt(batch, protectedDomains);
-    const raw = mode === 'groq'
-      ? await requestGroqJson(prompt, settings, groqApiKey, 'You are a conservative browser cleanup classifier.')
+    const raw = mode === 'openai-compatible'
+      ? await requestCloudJson(prompt, settings, apiKey, 'You are a conservative browser cleanup classifier.')
       : await requestLocalJson(prompt, 'You are a conservative browser cleanup classifier.');
     candidates.push(...parseCleanupCandidates(raw, batch, protectedDomains));
   }
@@ -521,7 +604,7 @@ async function proposeCleanupInBatches(input: ProjectTabInput[], protectedDomain
   });
 }
 
-export function createAIProvider(settings: ZenTabSettings, groqApiKey = ''): AIProvider {
+export function createAIProvider(settings: ZenTabSettings, cloudApiKey = ''): AIProvider {
   const heuristic: AIProvider = {
     async getCapabilities(): Promise<ProviderCapabilities> {
       return { available: true, name: 'heuristic', supportsSummaries: false };
@@ -539,33 +622,47 @@ export function createAIProvider(settings: ZenTabSettings, groqApiKey = ''): AIP
 
   return {
     async getCapabilities(): Promise<ProviderCapabilities> {
-      const globalObject = globalThis as unknown as { LanguageModel?: unknown; ai?: { languageModel?: unknown } };
-      if (settings.aiProvider === 'groq' && groqApiKey) return { available: true, name: 'groq', supportsSummaries: true };
-      if (globalObject.LanguageModel || globalObject.ai?.languageModel) return { available: true, name: 'local-model', supportsSummaries: true };
+      if (settings.aiProvider === 'openai-compatible' && cloudApiKey) return { available: true, name: 'openai-compatible', supportsSummaries: true };
+      if (localModelApi()) return { available: true, name: 'local-model', supportsSummaries: true };
       return heuristic.getCapabilities();
     },
     async proposeProjects(input) {
-      if (settings.aiProvider === 'groq' && groqApiKey) {
-        const groqProposal = await proposeInBatches(input, 'groq', settings, groqApiKey);
-        if (groqProposal) return groqProposal;
+      if (settings.aiProvider === 'openai-compatible' && cloudApiKey) {
+        const cloudProposal = await proposeInBatches(input, 'openai-compatible', settings, cloudApiKey);
+        if (cloudProposal) return cloudProposal;
       }
       if (localModelApi()) {
-        const localProposal = await proposeInBatches(input, 'local-model', settings, groqApiKey);
+        const localProposal = await proposeInBatches(input, 'local-model', settings, cloudApiKey);
         if (localProposal) return localProposal;
       }
       return heuristic.proposeProjects(input);
     },
     async proposeCleanup(input, protectedDomains) {
-      if (settings.aiProvider === 'groq' && groqApiKey) {
-        return proposeCleanupInBatches(input, protectedDomains, 'groq', settings, groqApiKey);
+      if (settings.aiProvider === 'openai-compatible' && cloudApiKey) {
+        return proposeCleanupInBatches(input, protectedDomains, 'openai-compatible', settings, cloudApiKey);
       }
-      if (localModelApi()) return proposeCleanupInBatches(input, protectedDomains, 'local-model', settings, groqApiKey);
+      if (localModelApi()) return proposeCleanupInBatches(input, protectedDomains, 'local-model', settings, cloudApiKey);
       return heuristic.proposeCleanup(input, protectedDomains);
     },
     async summarizeTabs() {
       return [];
     },
   };
+}
+
+export type BuiltInAiStatus = 'unsupported' | 'unavailable' | 'downloadable' | 'downloading' | 'available';
+
+export async function getBuiltInAiStatus(): Promise<BuiltInAiStatus> {
+  const api = localModelApi() as { availability?: () => Promise<string> } | null;
+  if (!api) return 'unsupported';
+  if (typeof api.availability !== 'function') return 'available';
+  try {
+    const status = await api.availability();
+    if (status === 'available' || status === 'downloadable' || status === 'downloading' || status === 'unavailable') return status;
+    return status === 'readily' ? 'available' : status === 'after-download' ? 'downloadable' : 'unavailable';
+  } catch {
+    return 'unavailable';
+  }
 }
 
 export function heuristicCleanup(input: ProjectTabInput[], protectedDomains: string[]): { tabId: number; title: string; url: string; confidence: 'high' | 'medium' | 'low'; reason: string; evidence: string[]; protected: boolean }[] {

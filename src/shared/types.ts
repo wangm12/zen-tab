@@ -40,6 +40,8 @@ export type WindowSnapshot = {
 export type DuplicateScope = 'same-window' | 'all-normal-windows';
 export type Language = 'en' | 'zh';
 export type ThemePreference = 'system' | 'light' | 'dark';
+export type AiProviderKind = 'local' | 'openai-compatible';
+export type AutoDiscardMinutes = 15 | 30 | 60 | 120;
 
 export type ZenTabSettings = {
   language: Language;
@@ -49,8 +51,12 @@ export type ZenTabSettings = {
   ignoredDomains: string[];
   protectedDomains: string[];
   deepAnalysisEnabled: boolean;
-  aiProvider: 'local' | 'groq';
-  groqModel: string;
+  aiProvider: AiProviderKind;
+  openaiBaseUrl: string;
+  openaiModel: string;
+  autoDiscardEnabled: boolean;
+  autoDiscardMinutes: AutoDiscardMinutes;
+  autoDiscardInspectPages: boolean;
   incognitoEnabled: boolean;
 };
 
@@ -63,7 +69,11 @@ export const DEFAULT_SETTINGS: ZenTabSettings = {
   protectedDomains: ['figma.com', 'docs.google.com', 'meet.google.com', 'slack.com', 'discord.com', 'linear.app', 'notion.so', 'zoom.us', 'teams.microsoft.com', 'miro.com', 'localhost'],
   deepAnalysisEnabled: false,
   aiProvider: 'local',
-  groqModel: 'llama-3.3-70b-versatile',
+  openaiBaseUrl: 'https://api.groq.com/openai/v1',
+  openaiModel: 'llama-3.3-70b-versatile',
+  autoDiscardEnabled: false,
+  autoDiscardMinutes: 30,
+  autoDiscardInspectPages: false,
   incognitoEnabled: false,
 };
 
@@ -132,7 +142,7 @@ export type ProjectGroupProposal = {
 
 export type GroupProposal = {
   proposalId: string;
-  provider: 'local-heuristic' | 'local-model' | 'groq';
+  provider: 'local-heuristic' | 'local-model' | 'groq' | 'openai-compatible';
   groups: ProjectGroupProposal[];
   unclassifiedTabIds: number[];
   analyzedTabCount: number;
@@ -181,12 +191,20 @@ export type ToastMessage = {
   action?: 'undo' | 'open-settings';
 };
 
+export type RecentSession = {
+  sessionId: string;
+  lastModified: number;
+  title: string;
+  tabCount: number;
+  kind: 'tab' | 'window';
+};
+
 export type ZenTabSnapshot = {
   windows: WindowSnapshot[];
   stashes: StashRecord[];
   projectMemory: ProjectMemoryRule[];
   settings: ZenTabSettings;
-  hasGroqApiKey: boolean;
+  hasCloudApiKey: boolean;
   lastAction?: ActionJournal;
 };
 
@@ -212,10 +230,13 @@ export type ZenTabMessage =
   | { type: 'DELETE_STASH'; stashId: string }
   | { type: 'UNDO_ACTION' }
   | { type: 'CLEAR_PROJECT_MEMORY' }
-  | { type: 'UPDATE_GROUP'; groupId: number; action: 'rename' | 'color'; title?: string; color?: GroupColor }
+  | { type: 'UPDATE_GROUP'; groupId: number; action: 'rename' | 'color' | 'collapse'; title?: string; color?: GroupColor; collapsed?: boolean }
   | { type: 'UNGROUP_GROUP'; groupId: number }
   | { type: 'UPDATE_SETTINGS'; patch: Partial<ZenTabSettings> }
-  | { type: 'UPDATE_GROQ_KEY'; apiKey: string }
+  | { type: 'UPDATE_CLOUD_KEY'; apiKey: string }
+  | { type: 'IMPORT_STASHES'; stashes: StashRecord[] }
+  | { type: 'LIST_RECENT_SESSIONS' }
+  | { type: 'RESTORE_SESSION'; sessionId: string }
   | { type: 'CLOSE_TABS'; tabIds: number[] }
   | { type: 'MOVE_TAB'; tabId: number; windowId: number; index: number }
   | { type: 'GROUP_TAB'; tabId: number; groupId: number }
@@ -229,7 +250,7 @@ export type ZenTabEvent =
 
 export type ProviderCapabilities = {
   available: boolean;
-  name: 'local-model' | 'groq' | 'heuristic';
+  name: 'local-model' | 'openai-compatible' | 'heuristic';
   supportsSummaries: boolean;
 };
 

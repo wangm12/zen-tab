@@ -71,18 +71,23 @@ const STOP_WORDS = new Set([
   'docs', 'home', 'index', 'the', 'and', 'for', 'with', 'from', 'this', 'that', 'new', 'login',
 ]);
 
-export function extractProjectTokens(input: { title: string; url: string; summary?: string }): string[] {
-  const source = `${input.title} ${input.title} ${input.url} ${input.summary ?? ''}`
+function tokenize(source: string): string[] {
+  return source
     .replace(/[/?#=&%_.:+\-()[\]{}"'`,;|]+/g, ' ')
     .replace(/\b\d{5,}\b/g, ' ')
-    .toLowerCase();
-
-  const tokens = source
+    .toLowerCase()
     .split(/\s+/)
     .map((token) => token.trim())
     .filter((token) => token.length >= 3 && !STOP_WORDS.has(token) && !/^[0-9]+$/.test(token));
+}
 
-  return [...new Set(tokens)];
+export function hostTokensFromUrl(rawUrl: string): Set<string> {
+  const hostname = getHostname(rawUrl).replace(/^www\./, '');
+  return new Set(tokenize(hostname.replace(/\./g, ' ')));
+}
+
+export function extractProjectTokens(input: { title: string; url: string; summary?: string }): string[] {
+  return [...new Set(tokenize(`${input.title} ${input.title} ${input.url} ${input.summary ?? ''}`))];
 }
 
 export function displayHostname(rawUrl: string): string {

@@ -34,6 +34,19 @@ describe('storage validation', () => {
     expect(settings.protectedDomains).toContain('figma.com');
     expect(settings.ignoredDomains).toEqual([]);
     expect(settings.deepAnalysisEnabled).toBe(false);
+    expect(settings.autoDiscardInspectPages).toBe(false);
+  });
+
+  it('migrates groq provider settings to openai-compatible', async () => {
+    storage['zen-tab.settings'] = {
+      aiProvider: 'groq',
+      groqModel: 'llama-3.3-70b-versatile',
+    };
+    const settings = await loadSettings();
+    expect(settings.aiProvider).toBe('openai-compatible');
+    expect(settings.openaiModel).toBe('llama-3.3-70b-versatile');
+    expect(settings.openaiBaseUrl).toBe('https://api.groq.com/openai/v1');
+    expect(settings.autoDiscardEnabled).toBe(false);
   });
 
   it('filters malformed stashes and migrates missing per-tab restore fields', async () => {

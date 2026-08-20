@@ -5,7 +5,9 @@ import {
   StashedTab,
   ProjectMemoryRule,
   ZenTabSettings,
+  AutoDiscardMinutes,
 } from './types';
+import { DEFAULT_GROQ_BASE_URL, DEFAULT_OPENAI_MODEL, normalizeOpenAiBaseUrl } from './openai';
 
 const SETTINGS_KEY = 'zen-tab.settings';
 const STASHES_KEY = 'zen-tab.stashes';
@@ -108,9 +110,21 @@ function normalizeProjectMemory(value: unknown): ProjectMemoryRule[] {
   return rules.sort((left, right) => right.updatedAt - left.updatedAt).slice(0, MAX_PROJECT_MEMORY_RULES);
 }
 
+function autoDiscardMinutes(value: unknown): AutoDiscardMinutes {
+  return value === 15 || value === 30 || value === 60 || value === 120 ? value : DEFAULT_SETTINGS.autoDiscardMinutes;
+}
+
 export async function loadSettings(): Promise<ZenTabSettings> {
   const stored = await readStorageKey<unknown>(SETTINGS_KEY, LEGACY_SETTINGS_KEY);
   const safeSettings = isRecord(stored) ? stored : {};
+  const migratedProvider = safeSettings.aiProvider === 'groq' || safeSettings.aiProvider === 'openai-compatible'
+    ? 'openai-compatible' as const
+    : DEFAULT_SETTINGS.aiProvider;
+  const openaiModel = typeof safeSettings.openaiModel === 'string' && safeSettings.openaiModel.trim()
+    ? safeSettings.openaiModel.trim()
+    : typeof safeSettings.groqModel === 'string' && safeSettings.groqModel.trim()
+      ? safeSettings.groqModel.trim()
+      : DEFAULT_OPENAI_MODEL;
   return {
     ...DEFAULT_SETTINGS,
     duplicateEnabled: typeof safeSettings.duplicateEnabled === 'boolean' ? safeSettings.duplicateEnabled : DEFAULT_SETTINGS.duplicateEnabled,
@@ -118,8 +132,12 @@ export async function loadSettings(): Promise<ZenTabSettings> {
     ignoredDomains: stringArray(safeSettings.ignoredDomains, DEFAULT_SETTINGS.ignoredDomains),
     protectedDomains: stringArray(safeSettings.protectedDomains, DEFAULT_SETTINGS.protectedDomains),
     deepAnalysisEnabled: typeof safeSettings.deepAnalysisEnabled === 'boolean' ? safeSettings.deepAnalysisEnabled : DEFAULT_SETTINGS.deepAnalysisEnabled,
-    aiProvider: safeSettings.aiProvider === 'groq' ? 'groq' : DEFAULT_SETTINGS.aiProvider,
-    groqModel: typeof safeSettings.groqModel === 'string' && safeSettings.groqModel.trim() ? safeSettings.groqModel.trim() : DEFAULT_SETTINGS.groqModel,
+    aiProvider: migratedProvider,
+    openaiBaseUrl: typeof safeSettings.openaiBaseUrl === 'string' ? normalizeOpenAiBaseUrl(safeSettings.openaiBaseUrl) : DEFAULT_GROQ_BASE_URL,
+    openaiModel,
+    autoDiscardEnabled: typeof safeSettings.autoDiscardEnabled === 'boolean' ? safeSettings.autoDiscardEnabled : DEFAULT_SETTINGS.autoDiscardEnabled,
+    autoDiscardMinutes: autoDiscardMinutes(safeSettings.autoDiscardMinutes),
+    autoDiscardInspectPages: typeof safeSettings.autoDiscardInspectPages === 'boolean' ? safeSettings.autoDiscardInspectPages : DEFAULT_SETTINGS.autoDiscardInspectPages,
     incognitoEnabled: typeof safeSettings.incognitoEnabled === 'boolean' ? safeSettings.incognitoEnabled : DEFAULT_SETTINGS.incognitoEnabled,
     language: safeSettings.language === 'zh' ? 'zh' : 'en',
     theme: safeSettings.theme === 'light' || safeSettings.theme === 'dark' ? safeSettings.theme : 'system',

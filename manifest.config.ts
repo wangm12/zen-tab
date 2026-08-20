@@ -6,9 +6,9 @@ export default defineManifest({
   description: 'A calm, fast workspace for your browser tabs.',
   version: '0.1.0',
   minimum_chrome_version: '116',
-  permissions: ['tabs', 'tabGroups', 'sidePanel', 'storage'],
+  permissions: ['tabs', 'tabGroups', 'sidePanel', 'storage', 'alarms', 'sessions'],
   optional_permissions: ['scripting'],
-  optional_host_permissions: ['<all_urls>', 'https://api.groq.com/*'],
+  optional_host_permissions: ['<all_urls>', 'https://api.groq.com/*', 'https://api.openai.com/*', 'http://127.0.0.1/*', 'http://localhost/*'],
   background: {
     service_worker: 'src/background/service-worker.ts',
     type: 'module',
@@ -28,5 +28,14 @@ export default defineManifest({
   },
   side_panel: {
     default_path: 'sidepanel.html',
+  },
+  commands: {
+    _execute_action: {
+      suggested_key: {
+        default: 'Ctrl+Shift+Space',
+        mac: 'Command+Shift+Space',
+      },
+      description: 'Open Zen Tab',
+    },
   },
 });

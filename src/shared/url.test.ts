@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { canonicalizeUrl, extractProjectTokens, isLocalAddress, isSpecialUrl } from './url';
+import { canonicalizeUrl, extractProjectTokens, hostTokensFromUrl, isLocalAddress, isSpecialUrl } from './url';
 
 describe('canonicalizeUrl', () => {
   it('removes tracking noise, fragments, and a trailing slash', () => {
@@ -30,5 +30,10 @@ describe('tab safety and project signals', () => {
     });
     expect(tokens).toEqual(expect.arrayContaining(['zen', 'tab', 'prd', 'review', 'acme', 'performance', 'plan']));
     expect(tokens).not.toContain('github');
+  });
+
+  it('treats product hostnames as weak host tokens', () => {
+    expect([...hostTokensFromUrl('https://www.notion.so/hiring-plan')]).toContain('notion');
+    expect([...hostTokensFromUrl('https://docs.google.com/document/d/abc')]).not.toContain('google');
   });
 });
