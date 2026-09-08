@@ -25,8 +25,8 @@ export function shouldAutoDiscard(tab: DiscardableTab, settings: ZenTabSettings,
   if (!settings.autoDiscardEnabled) return false;
   if (tab.discarded || tab.pinned || tab.active || tab.audible) return false;
   if (isSpecialUrl(tab.url) || isLocalAddress(tab.url) || isProtectedHost(tab.url, settings.protectedDomains)) return false;
-  const lastAccessed = tab.lastAccessed ?? 0;
-  return now - lastAccessed >= settings.autoDiscardMinutes * 60_000;
+  if (typeof tab.lastAccessed !== 'number' || !Number.isFinite(tab.lastAccessed)) return false;
+  return now - tab.lastAccessed >= settings.autoDiscardMinutes * 60_000;
 }
 
 export function shouldSkipDiscardAfterInspect(options: {

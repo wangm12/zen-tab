@@ -32,6 +32,7 @@ describe('auto-discard eligibility', () => {
     expect(shouldAutoDiscard({ ...baseTab, url: 'https://docs.google.com/doc' }, enabled, now)).toBe(false);
     expect(shouldAutoDiscard({ ...baseTab, url: 'chrome://extensions' }, enabled, now)).toBe(false);
     expect(shouldAutoDiscard({ ...baseTab, lastAccessed: now - 60_000 }, enabled, now)).toBe(false);
+    expect(shouldAutoDiscard({ ...baseTab, lastAccessed: undefined }, enabled, now)).toBe(false);
   });
 });
 

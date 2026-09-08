@@ -3,7 +3,8 @@ import { shouldAutoDiscard, shouldSkipDiscardAfterInspect } from '../shared/disc
 import { createId } from '../shared/ids';
 import { hostPermissionForBaseUrl } from '../shared/openai';
 import { extractGroupingPageTextInPage } from '../shared/page-text';
-import { canonicalizeUrl, displayHostname, getHostname, isLocalAddress, isSpecialUrl } from '../shared/url';
+import { isCleanupProtectedTab, isExplicitlyCloseableTab, restoreDescriptorKey, restoreInsertIndex } from '../shared/tab-ops';
+import { canonicalizeUrl, displayHostname, getHostname, isSpecialUrl } from '../shared/url';
 import {
   ActionJournal,
   DEFAULT_SETTINGS,
@@ -46,7 +47,6 @@ const groupIndex = new Map<number, TabGroupRecord>();
 const creationTimes = new Map<number, number>();
 const pendingDuplicateChecks = new Map<number, ReturnType<typeof setTimeout>>();
 const handledDuplicateTabs = new Set<number>();
-const cleanupProposals = new Map<string, CleanupProposal>();
 const startupTabIds = new Set<number>();
 const ADAPTIVE_SUMMARY_LIMIT = 32;
 const ADAPTIVE_SUMMARY_BUDGET_MS = 8_000;
@@ -163,13 +163,12 @@ async function initialize(): Promise<void> {
     } catch {
       focusedWindowId = chrome.windows.WINDOW_ID_NONE;
     }
+    const allTabs = await chrome.tabs.query({});
+    for (const tab of allTabs) exemptFromDuplicateGuard(tab.id);
     const tabs = focusedWindowId === chrome.windows.WINDOW_ID_NONE
-      ? await chrome.tabs.query({})
-      : await chrome.tabs.query({ windowId: focusedWindowId });
-    for (const tab of tabs) {
-      if (tab.id != null) startupTabIds.add(tab.id);
-      indexTab(asTabRecord(tab));
-    }
+      ? allTabs
+      : allTabs.filter((tab) => tab.windowId === focusedWindowId);
+    for (const tab of tabs) indexTab(asTabRecord(tab));
     try {
       const groups = focusedWindowId === chrome.windows.WINDOW_ID_NONE
         ? await chrome.tabGroups.query({})
@@ -198,6 +197,7 @@ async function hydrateRemainingWindows(): Promise<void> {
   try {
     const tabs = await chrome.tabs.query({});
     for (const tab of tabs) {
+      exemptFromDuplicateGuard(tab.id);
       indexTab(asTabRecord(tab));
     }
     const groups = await chrome.tabGroups.query({});
@@ -252,6 +252,14 @@ async function buildSnapshot(): Promise<ZenTabSnapshot> {
 
 function sendEvent(event: ZenTabEvent): void {
   void chrome.runtime.sendMessage(event).catch(() => undefined);
+}
+
+function exemptFromDuplicateGuard(tabId: number | undefined): void {
+  if (tabId != null) startupTabIds.add(tabId);
+}
+
+function isCleanupProtected(tab: TabRecord): boolean {
+  return isCleanupProtectedTab(tab, { protectedDomains: settings.protectedDomains, incognitoEnabled: settings.incognitoEnabled });
 }
 
 function scheduleSnapshotBroadcast(): void {
@@ -589,7 +597,6 @@ async function ungroupGroup(groupId: number): Promise<{ ungrouped: number }> {
 }
 
 async function buildCleanupProposal(windowId: number): Promise<CleanupProposal> {
-  pruneCleanupProposals();
   const tabs = [...tabIndex.values()].filter((tab) => tab.windowId === windowId && (settings.incognitoEnabled || !tab.incognito) && !tab.pinned && !tab.active && !tab.audible && !isSpecialUrl(tab.url));
   const inputs = tabs.map((tab) => createTabInput(tab));
   const ruleCandidates = heuristicCleanup(inputs, settings.protectedDomains);
@@ -614,7 +621,7 @@ async function buildCleanupProposal(windowId: number): Promise<CleanupProposal> 
   }
   const candidates = raw.map((candidate) => {
     const tab = tabIndex.get(candidate.tabId);
-    const protectedByLocal = tab ? isCleanupProtectedTab(tab) : true;
+    const protectedByLocal = tab ? isCleanupProtected(tab) : true;
     const pageSafety = safety.get(candidate.tabId) ?? { protected: true, evidence: ['Page safety could not be verified.'] };
     return { ...candidate, evidence: [...candidate.evidence, ...pageSafety.evidence], protected: candidate.protected || protectedByLocal || pageSafety.protected };
   });
@@ -626,19 +633,7 @@ async function buildCleanupProposal(windowId: number): Promise<CleanupProposal> 
     analyzedTabIds: tabs.map((tab) => tab.tabId),
     expiresAt: Date.now() + 5 * 60_000,
   };
-  cleanupProposals.set(proposal.proposalId, proposal);
   return proposal;
-}
-
-function isCleanupProtectedTab(tab: TabRecord): boolean {
-  const host = getHostname(tab.url);
-  return tab.pinned
-    || tab.active
-    || tab.audible
-    || isSpecialUrl(tab.url)
-    || isLocalAddress(tab.url)
-    || (tab.incognito && !settings.incognitoEnabled)
-    || settings.protectedDomains.some((domain) => host === domain || host.endsWith(`.${domain}`));
 }
 
 async function hasPageSafetyPermission(): Promise<boolean> {
@@ -747,18 +742,6 @@ async function inspectCleanupSafety(tabId: number): Promise<{ protected: boolean
   return { protected: true, evidence: ['Page safety could not be verified.'] };
 }
 
-function pruneCleanupProposals(): void {
-  const now = Date.now();
-  for (const [proposalId, proposal] of cleanupProposals) {
-    if (proposal.expiresAt <= now) cleanupProposals.delete(proposalId);
-  }
-  while (cleanupProposals.size > 8) {
-    const oldest = cleanupProposals.keys().next().value;
-    if (oldest) cleanupProposals.delete(oldest);
-    else break;
-  }
-}
-
 async function removeTabsReliably(tabIds: number[]): Promise<number[]> {
   const requested = [...new Set(tabIds)];
   if (!requested.length) return [];
@@ -780,8 +763,11 @@ async function removeTabsReliably(tabIds: number[]): Promise<number[]> {
   }
 }
 
-async function closeTabsWithJournal(tabIds: number[], type: ActionJournal['type']): Promise<number> {
-  const tabs = tabIds.map((tabId) => tabIndex.get(tabId)).filter((tab): tab is TabRecord => Boolean(tab && !tab.pinned && !tab.active && (type !== 'cleanup' || !isCleanupProtectedTab(tab))));
+async function closeTabsWithJournal(tabIds: number[], type: 'cleanup' | 'close'): Promise<number> {
+  const tabs = tabIds.map((tabId) => tabIndex.get(tabId)).filter((tab): tab is TabRecord => {
+    if (type === 'close') return isExplicitlyCloseableTab(tab);
+    return Boolean(tab && !isCleanupProtected(tab));
+  });
   if (!tabs.length) return 0;
   const descriptors = tabs.map((tab) => restoreDescriptorFromTab(tab, tab.groupId !== -1 ? groupIndex.get(tab.groupId) : undefined));
   const closedIds = await removeTabsReliably(tabs.map((tab) => tab.tabId));
@@ -833,6 +819,8 @@ async function restoreDescriptors(descriptors: TabRestoreDescriptor[], preferred
     initialCreatedTabId = created.tabs?.[0]?.id ?? (await chrome.tabs.query({ windowId: targetWindowId }))[0]?.id;
   }
 
+  if (createdWindow) exemptFromDuplicateGuard(initialCreatedTabId);
+
   const createdTabs = new Map<number, number>();
   let failed = descriptors.length - ordered.length;
   for (let index = 0; index < ordered.length; index += 1) {
@@ -843,11 +831,12 @@ async function restoreDescriptors(descriptors: TabRestoreDescriptor[], preferred
         createdTabId = initialCreatedTabId;
       }
       if (createdTabId == null) {
-        const created = await chrome.tabs.create({ windowId: targetWindowId, url: descriptor.url, index: index, active: false });
+        const created = await chrome.tabs.create({ windowId: targetWindowId, url: descriptor.url, index: restoreInsertIndex(descriptor, index, createdWindow), active: false });
         createdTabId = created.id ?? undefined;
       }
       if (createdTabId == null) throw new Error('Chrome did not return a restored tab id.');
-      createdTabs.set(descriptor.tabId ?? -(index + 1), createdTabId);
+      exemptFromDuplicateGuard(createdTabId);
+      createdTabs.set(restoreDescriptorKey(descriptor, index), createdTabId);
       await chrome.tabs.update(createdTabId, { muted: descriptor.muted, pinned: descriptor.pinned }).catch(() => undefined);
     } catch {
       failed += 1;
@@ -856,9 +845,9 @@ async function restoreDescriptors(descriptors: TabRestoreDescriptor[], preferred
   }
 
   const groups = new Map<number, { tabIds: number[]; descriptor: TabRestoreDescriptor }>();
-  for (const descriptor of ordered) {
+  for (const [index, descriptor] of ordered.entries()) {
     if (descriptor.groupId === -1 || descriptor.pinned) continue;
-    const createdTabId = createdTabs.get(descriptor.tabId ?? -1);
+    const createdTabId = createdTabs.get(restoreDescriptorKey(descriptor, index));
     if (createdTabId == null) continue;
     const group = groups.get(descriptor.groupId) ?? { tabIds: [], descriptor };
     group.tabIds.push(createdTabId);
@@ -873,8 +862,8 @@ async function restoreDescriptors(descriptors: TabRestoreDescriptor[], preferred
     }
   }
 
-  const active = ordered.find((descriptor) => descriptor.active);
-  const activeTabId = active ? createdTabs.get(active.tabId ?? -1) : undefined;
+  const activeIndex = ordered.findIndex((descriptor) => descriptor.active);
+  const activeTabId = activeIndex >= 0 ? createdTabs.get(restoreDescriptorKey(ordered[activeIndex], activeIndex)) : undefined;
   if (activeTabId != null) {
     await chrome.tabs.update(activeTabId, { active: true }).catch(() => undefined);
     if (focus && targetWindowId != null) await chrome.windows.update(targetWindowId, { focused: true }).catch(() => undefined);
@@ -1084,9 +1073,10 @@ async function handleMessage(message: ZenTabMessage): Promise<unknown> {
     case 'RUN_CLEANUP_ANALYSIS':
       return buildCleanupProposal(message.windowId);
     case 'APPLY_CLEANUP': {
-      pruneCleanupProposals();
-      const proposal = cleanupProposals.get(message.proposalId);
-      if (!proposal || proposal.expiresAt <= Date.now()) throw new Error('Cleanup proposal expired.');
+      const proposal = message.proposal;
+      if (!proposal?.proposalId || !proposal.analyzedTabIds?.length || proposal.expiresAt <= Date.now()) {
+        throw new Error('Cleanup proposal expired.');
+      }
       const analyzed = new Set(proposal.analyzedTabIds);
       const candidates = new Map(proposal.candidates.map((candidate) => [candidate.tabId, candidate]));
       const requested = new Set(message.tabIds);
@@ -1095,14 +1085,13 @@ async function handleMessage(message: ZenTabMessage): Promise<unknown> {
       for (const tabId of requested) {
         const candidate = candidates.get(tabId);
         const tab = tabIndex.get(tabId);
-        if (!candidate || candidate.protected || !analyzed.has(tabId) || !tab || tab.windowId !== proposal.sourceWindowId || isCleanupProtectedTab(tab)) {
+        if (!candidate || candidate.protected || !analyzed.has(tabId) || !tab || tab.windowId !== proposal.sourceWindowId || isCleanupProtected(tab)) {
           skipped += 1;
           continue;
         }
         eligible.push(tabId);
       }
       const count = await closeTabsWithJournal(eligible, 'cleanup');
-      cleanupProposals.delete(message.proposalId);
       return { closed: count, skipped };
     }
     case 'STASH':
@@ -1143,11 +1132,15 @@ async function handleMessage(message: ZenTabMessage): Promise<unknown> {
       return importStashes(message.stashes);
     case 'LIST_RECENT_SESSIONS':
       return listRecentSessions();
-    case 'RESTORE_SESSION':
-      await chrome.sessions.restore(message.sessionId);
+    case 'RESTORE_SESSION': {
+      const session = await chrome.sessions.restore(message.sessionId);
+      for (const tab of session.window?.tabs ?? (session.tab ? [session.tab] : [])) {
+        exemptFromDuplicateGuard(tab.id);
+      }
       return { restored: true };
+    }
     case 'CLOSE_TABS':
-      return { closed: await closeTabsWithJournal([...new Set(message.tabIds)], 'cleanup') };
+      return { closed: await closeTabsWithJournal([...new Set(message.tabIds)], 'close') };
     case 'MOVE_TAB':
       await chrome.tabs.move(message.tabId, { windowId: message.windowId, index: message.index });
       await refreshWindowTabIndexes(message.windowId);
@@ -1161,7 +1154,7 @@ async function handleMessage(message: ZenTabMessage): Promise<unknown> {
       return ungroupGroup(message.groupId);
     case 'UPDATE_TAB':
       if (message.action === 'discard') await chrome.tabs.discard(message.tabId);
-      else if (message.action === 'close') return { closed: await closeTabsWithJournal([message.tabId], 'cleanup') };
+      else if (message.action === 'close') return { closed: await closeTabsWithJournal([message.tabId], 'close') };
       else if (message.action === 'activate') {
         const tab = tabIndex.get(message.tabId);
         if (!tab) throw new Error('Tab no longer exists.');
@@ -1219,7 +1212,6 @@ chrome.tabs.onCreated.addListener((tab) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   indexTab(asTabRecord(tab));
-  if (changeInfo.url) startupTabIds.delete(tabId);
   if (changeInfo.url || changeInfo.status === 'complete') scheduleDuplicateCheck(tabId);
   scheduleSnapshotBroadcast();
 });

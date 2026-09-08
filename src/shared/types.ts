@@ -109,7 +109,7 @@ export type StashRecord = {
 
 export type ActionJournal = {
   actionId: string;
-  type: 'duplicate' | 'group' | 'cleanup' | 'stash';
+  type: 'duplicate' | 'group' | 'cleanup' | 'stash' | 'close';
   createdAt: number;
   affectedTabIds: number[];
   restoreData?: unknown;
@@ -221,7 +221,7 @@ export type ZenTabMessage =
   | { type: 'RUN_GROUP_ANALYSIS'; windowId: number; deepScanAll?: boolean }
   | { type: 'APPLY_GROUP_PROPOSAL'; proposal: GroupProposal }
   | { type: 'RUN_CLEANUP_ANALYSIS'; windowId: number }
-  | { type: 'APPLY_CLEANUP'; proposalId: string; tabIds: number[] }
+  | { type: 'APPLY_CLEANUP'; proposal: CleanupProposal; tabIds: number[] }
   | { type: 'STASH'; windowId: number; scope: 'window' | 'group' | 'tabs'; groupId?: number; tabIds?: number[]; includePinned?: boolean; includeActive?: boolean }
   | { type: 'STASH_WINDOW'; windowId: number; includePinned?: boolean; includeActive?: boolean }
   | { type: 'RESTORE_STASH'; stashId: string }

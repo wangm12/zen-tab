@@ -54,7 +54,7 @@ function App() {
   const currentWindow = snapshot?.windows.find((window) => window.windowId === selectedWindowId) ?? snapshot?.windows[0];
   const proposalTabs = draftGroupProposal ? snapshot?.windows.find((window) => window.windowId === draftGroupProposal.sourceWindowId)?.tabs ?? [] : [];
   const tabCount = snapshot?.windows.reduce((sum, window) => sum + window.tabs.length, 0) ?? 0;
-  const audibleTabs = currentWindow?.tabs.filter((tab) => tab.audible && !tab.muted) ?? [];
+  const audibleTabs = currentWindow?.tabs.filter((tab) => tab.audible) ?? [];
 
   const action = useCallback(async (message: Parameters<typeof request>[0], success?: string, successAction?: ToastMessage['action']): Promise<boolean> => {
     try {
@@ -162,7 +162,7 @@ function App() {
 
   const applyCleanup = useCallback(async (proposal: CleanupProposal, tabIds: number[]) => {
     try {
-      const result = await request<{ closed: number; skipped: number }>({ type: 'APPLY_CLEANUP', proposalId: proposal.proposalId, tabIds });
+      const result = await request<{ closed: number; skipped: number }>({ type: 'APPLY_CLEANUP', proposal, tabIds });
       showToast({ id: `${Date.now()}`, tone: result.skipped > 0 ? 'warning' : 'success', message: result.skipped > 0 ? t('tabsClosedWithSkipped', { closed: result.closed, skipped: result.skipped }) : t('tabsClosed', { count: result.closed }), ...(result.closed > 0 ? { action: 'undo' as const } : {}) });
       setModal(null);
     } catch (cleanupError) {
@@ -269,7 +269,7 @@ function App() {
             ))}
           </div>}
 
-          <AudioBar tabs={audibleTabs} t={t} onActivate={(tab) => void action({ type: 'UPDATE_TAB', tabId: tab.tabId, windowId: tab.windowId, action: 'activate' })} onMuteAll={() => { audibleTabs.forEach((tab) => void action({ type: 'UPDATE_TAB', tabId: tab.tabId, action: 'mute' })); }} />
+          <AudioBar tabs={audibleTabs} t={t} onActivate={(tab) => void action({ type: 'UPDATE_TAB', tabId: tab.tabId, windowId: tab.windowId, action: 'activate' })} onMuteAll={() => { audibleTabs.filter((tab) => !tab.muted).forEach((tab) => void action({ type: 'UPDATE_TAB', tabId: tab.tabId, action: 'mute' })); }} />
 
           <div className="command-row">
             <label className="search-box">

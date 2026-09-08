@@ -81,7 +81,7 @@ function normalizeStash(value: unknown): StashRecord | null {
 function isActionJournal(value: unknown): value is ActionJournal {
   if (!isRecord(value)) return false;
   return typeof value.actionId === 'string'
-    && (value.type === 'duplicate' || value.type === 'group' || value.type === 'cleanup' || value.type === 'stash')
+    && (value.type === 'duplicate' || value.type === 'group' || value.type === 'cleanup' || value.type === 'stash' || value.type === 'close')
     && typeof value.createdAt === 'number'
     && Array.isArray(value.affectedTabIds)
     && value.affectedTabIds.every((tabId) => typeof tabId === 'number')

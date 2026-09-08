@@ -7,17 +7,18 @@ import { useZenTabStore } from './store';
 export type RequestFn = <T = unknown>(message: ZenTabMessage) => Promise<T>;
 export const TOAST_DURATION_MS = 5000;
 
-export function ModalFrame({ eyebrow, title, description, closeLabel, onClose, children, footer }: { eyebrow: string; title: string; description: string; closeLabel?: string; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode }) {
-  const dialogRef = useRef<HTMLElement>(null);
+function focusableIn(container: HTMLElement | null): HTMLElement[] {
+  return [...(container?.querySelectorAll<HTMLElement>('button, input, select, textarea, [href], [tabindex]:not([tabindex="-1"])') ?? [])].filter((element) => !element.hasAttribute('disabled'));
+}
+
+export function useFocusTrap(containerRef: React.RefObject<HTMLElement | null>, onClose: () => void, initialFocusRef?: React.RefObject<HTMLElement | null>, active = true) {
   const onCloseRef = useRef(onClose);
-  const titleId = `${useId()}-title`;
-  const descriptionId = `${useId()}-description`;
   useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
   useEffect(() => {
+    if (!active) return;
     const previous = document.activeElement as HTMLElement | null;
-    const dialog = dialogRef.current;
-    const focusable = () => [...(dialog?.querySelectorAll<HTMLElement>('button, input, select, textarea, [href], [tabindex]:not([tabindex="-1"])') ?? [])].filter((element) => !element.hasAttribute('disabled'));
-    focusable()[0]?.focus();
+    const dialog = containerRef.current;
+    (initialFocusRef?.current ?? focusableIn(dialog)[0])?.focus();
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.preventDefault();
@@ -25,7 +26,7 @@ export function ModalFrame({ eyebrow, title, description, closeLabel, onClose, c
         return;
       }
       if (event.key !== 'Tab') return;
-      const items = focusable();
+      const items = focusableIn(dialog);
       if (!items.length) return;
       const first = items[0];
       const last = items[items.length - 1];
@@ -42,7 +43,14 @@ export function ModalFrame({ eyebrow, title, description, closeLabel, onClose, c
       document.removeEventListener('keydown', handleKeyDown);
       if (previous?.isConnected) previous.focus();
     };
-  }, []);
+  }, [active, containerRef, initialFocusRef]);
+}
+
+export function ModalFrame({ eyebrow, title, description, closeLabel, onClose, children, footer }: { eyebrow: string; title: string; description: string; closeLabel?: string; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode }) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const titleId = `${useId()}-title`;
+  const descriptionId = `${useId()}-description`;
+  useFocusTrap(dialogRef, onClose);
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}><section ref={dialogRef} className="modal-sheet" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={descriptionId}>
     <header className="modal-header"><div><span className="eyebrow">{eyebrow}</span><h2 id={titleId}>{title}</h2><p id={descriptionId}>{description}</p></div><button className="icon-button" onClick={onClose} aria-label={closeLabel ?? 'Close'}><X size={18} /></button></header>
     <div className="modal-content">{children}</div>

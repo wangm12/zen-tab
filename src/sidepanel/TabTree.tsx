@@ -4,6 +4,7 @@ import {
   Archive, Check, ChevronDown, ChevronRight, Globe2, LockKeyhole, MicOff, MoreHorizontal, Palette, Pencil, Pin, Trash2, Ungroup, Volume2,
 } from 'lucide-react';
 import { displayHostname } from '../shared/url';
+import { sortGroupsByStripOrder } from '../shared/tab-ops';
 import { GroupColor, TabRecord, WindowSnapshot, ZenTabMessage } from '../shared/types';
 import { Translator } from './i18n';
 
@@ -46,7 +47,7 @@ export function TabTree({ windowSnapshot, search, t, onToggleGroup, onStashGroup
     for (const tab of windowSnapshot.tabs) {
       if (tab.groupId === -1) ungrouped.push(tab); else groups.set(tab.groupId, [...(groups.get(tab.groupId) ?? []), tab]);
     }
-    for (const group of [...windowSnapshot.groups].sort((a, b) => a.groupId - b.groupId)) {
+    for (const group of sortGroupsByStripOrder([...windowSnapshot.groups], windowSnapshot.tabs)) {
       const tabs = (groups.get(group.groupId) ?? []).filter(matches);
       if (normalizedSearch && tabs.length === 0) continue;
       next.push({ kind: 'group', id: group.groupId, name: group.title || t('untitledGroup'), color: group.color, count: tabs.length, collapsed: group.collapsed });
@@ -197,7 +198,7 @@ export function TabTree({ windowSnapshot, search, t, onToggleGroup, onStashGroup
     clearDrag();
   }, [clearDrag, draggedTabId, markReorganized, onAction]);
 
-  const virtualizer = useVirtualizer({ count: rows.length, getScrollElement: () => scrollRef.current, estimateSize: (index) => rows[index].kind === 'group' ? 37 : 62, overscan: 10 });
+  const virtualizer = useVirtualizer({ count: rows.length, getScrollElement: () => scrollRef.current, estimateSize: (index) => rows[index].kind === 'group' ? 40 : 62, overscan: 10 });
   const activeTabId = windowSnapshot?.tabs.find((tab) => tab.active)?.tabId ?? null;
   const lastScrolledActiveTabId = useRef<number | null>(null);
 
