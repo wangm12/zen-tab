@@ -1,4 +1,5 @@
-import { TabRecord, WindowSnapshot } from '../shared/types';
+import { searchBookmarks } from '../shared/bookmark-search';
+import { BookmarkRecord, StashRecord, TabRecord, WindowSnapshot } from '../shared/types';
 import { Translator } from './i18n';
 
 export type PaletteEntry = {
@@ -9,6 +10,8 @@ export type PaletteEntry = {
   tab?: TabRecord;
   windowId?: number;
   favIconUrl?: string;
+  url?: string;
+  stashId?: string;
 };
 
 function hostLabel(url: string): string {
@@ -19,13 +22,29 @@ function hostLabel(url: string): string {
   }
 }
 
-export function buildPaletteEntries(windows: WindowSnapshot[], query: string, t: Translator): PaletteEntry[] {
+function matchesHaystack(item: Pick<PaletteEntry, 'label' | 'detail'>, haystack: string): boolean {
+  return `${item.label} ${item.detail ?? ''}`.toLowerCase().includes(haystack);
+}
+
+function stashMatches(stash: StashRecord, haystack: string): boolean {
+  if (stash.name.toLowerCase().includes(haystack)) return true;
+  return stash.tabs.some((tab) => tab.title.toLowerCase().includes(haystack) || tab.url.toLowerCase().includes(haystack));
+}
+
+export function buildPaletteEntries(
+  windows: WindowSnapshot[],
+  query: string,
+  t: Translator,
+  bookmarks: BookmarkRecord[] = [],
+  stashes: StashRecord[] = [],
+): PaletteEntry[] {
   const staticCommands: PaletteEntry[] = [
     { id: 'group', label: t('cmdGroup'), commandId: 'group' },
     { id: 'cleanup', label: t('cmdCleanup'), commandId: 'cleanup' },
     { id: 'stash-window', label: t('cmdStashWindow'), commandId: 'stash-window' },
     { id: 'stash-all', label: t('cmdStashAll'), commandId: 'stash-all' },
     { id: 'stash-library', label: t('cmdStashLibrary'), commandId: 'stash-library' },
+    { id: 'bookmarks', label: t('cmdBookmarks'), commandId: 'bookmarks' },
     { id: 'export-window', label: t('cmdExportWindow'), commandId: 'export-window' },
     { id: 'settings', label: t('cmdSettings'), commandId: 'settings' },
     { id: 'search', label: t('cmdFocusSearch'), commandId: 'search' },
@@ -50,7 +69,23 @@ export function buildPaletteEntries(windows: WindowSnapshot[], query: string, t:
     };
   }));
   const haystack = query.trim().toLowerCase();
-  return [...staticCommands, ...windowCommands, ...tabs]
-    .filter((item) => !haystack || `${item.label} ${item.detail ?? ''}`.toLowerCase().includes(haystack))
-    .slice(0, 40);
+  if (!haystack) return [...staticCommands, ...windowCommands, ...tabs].slice(0, 40);
+
+  const matchingTabs = tabs.filter((item) => matchesHaystack(item, haystack));
+  const bookmarkEntries = searchBookmarks(bookmarks, query).map(({ bookmark }) => ({
+    id: `bookmark-${bookmark.id}`,
+    label: bookmark.title || bookmark.url,
+    detail: [hostLabel(bookmark.url), bookmark.folderPath.split(' / ').at(-1)].filter(Boolean).join(' · '),
+    commandId: 'jump-bookmark',
+    url: bookmark.url,
+  }));
+  const stashEntries = stashes.filter((stash) => stashMatches(stash, haystack)).map((stash) => ({
+    id: `stash-${stash.id}`,
+    label: stash.name,
+    detail: `${stash.tabs.length} · ${t('cmdJumpStash')}`,
+    commandId: 'jump-stash',
+    stashId: stash.id,
+  }));
+  const matchingCommands = [...staticCommands, ...windowCommands].filter((item) => matchesHaystack(item, haystack));
+  return [...matchingTabs, ...bookmarkEntries, ...stashEntries, ...matchingCommands].slice(0, 40);
 }

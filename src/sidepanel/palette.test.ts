@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { createTranslator } from './i18n';
 import { buildPaletteEntries } from './palette';
-import { WindowSnapshot } from '../shared/types';
+import { BookmarkRecord, StashRecord, WindowSnapshot } from '../shared/types';
 
 const t = createTranslator('en');
 
@@ -39,6 +39,35 @@ const windows: WindowSnapshot[] = [
   },
 ];
 
+const bookmarks: BookmarkRecord[] = [{
+  id: 'bookmark-1',
+  parentId: 'folder-1',
+  title: 'React rendering guide',
+  url: 'https://react.dev/learn/render-and-commit',
+  folderPath: 'Bookmarks bar / Engineering',
+  isInbox: false,
+  isBookmarksBar: true,
+}];
+
+const stashes: StashRecord[] = [{
+  version: 1,
+  id: 'research-1',
+  name: 'Research dump',
+  createdAt: 1,
+  sourceWindowId: 11,
+  incognito: false,
+  tabs: [{
+    url: 'https://papers.example/item',
+    title: 'Papers',
+    windowId: 11,
+    index: 0,
+    active: true,
+    pinned: false,
+    muted: false,
+    groupId: -1,
+  }],
+}];
+
 describe('command palette entries', () => {
   it('includes a switch-window command for each open window', () => {
     const entries = buildPaletteEntries(windows, '', t);
@@ -65,5 +94,48 @@ describe('command palette entries', () => {
         favIconUrl: 'https://example.com/favicon.ico',
       }),
     ]);
+  });
+
+  it('includes fuzzy bookmark hits without changing the default argument', () => {
+    expect(buildPaletteEntries(windows, 'rendering', t, bookmarks)).toEqual([
+      expect.objectContaining({
+        commandId: 'jump-bookmark',
+        label: 'React rendering guide',
+        detail: 'react.dev · Engineering',
+        url: 'https://react.dev/learn/render-and-commit',
+      }),
+    ]);
+    expect(buildPaletteEntries(windows, '', t).some((entry) => entry.commandId === 'jump-bookmark')).toBe(false);
+  });
+
+  it('includes a jump-stash hit when the query matches a stash name', () => {
+    const entries = buildPaletteEntries(windows, 'research', t, [], stashes);
+    expect(entries).toContainEqual(expect.objectContaining({
+      id: 'stash-research-1',
+      commandId: 'jump-stash',
+      stashId: 'research-1',
+      label: 'Research dump',
+      detail: `1 · ${t('cmdJumpStash')}`,
+    }));
+  });
+
+  it('omits jump-stash from the empty command dump', () => {
+    expect(buildPaletteEntries(windows, '', t, bookmarks, stashes).some((entry) => entry.commandId === 'jump-stash')).toBe(false);
+  });
+
+  it('ranks a matching tab before a matching command', () => {
+    const entries = buildPaletteEntries(windows, 'tab', t);
+    const tabIndex = entries.findIndex((entry) => entry.commandId === 'jump-tab');
+    const commandIndex = entries.findIndex((entry) => entry.commandId === 'group');
+    expect(tabIndex).toBeGreaterThanOrEqual(0);
+    expect(commandIndex).toBeGreaterThanOrEqual(0);
+    expect(tabIndex).toBeLessThan(commandIndex);
+  });
+
+  it('defaults omitted bookmarks and stashes to empty lists', () => {
+    const entries = buildPaletteEntries(windows, '', t);
+    expect(entries.some((entry) => entry.commandId === 'jump-bookmark')).toBe(false);
+    expect(entries.some((entry) => entry.commandId === 'jump-stash')).toBe(false);
+    expect(entries.some((entry) => entry.commandId === 'switch-window')).toBe(true);
   });
 });

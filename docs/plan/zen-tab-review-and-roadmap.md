@@ -72,14 +72,13 @@ graph TD
 
 ## 三、已知缺口（先于新功能）
 
-这些会直接拖累后续 milestone，应作为 **Milestone 0** 处理，而不是和新功能混在一起。
+M0 里该关的口大多已关：设置页有 `ignoredDomains` / 无痕开关；分组折叠会同步原生 Tab Group；Stash / Settings / 列表已从 `App.tsx` 拆出；`alarms` 与 `commands` 已按 opt-in 休眠和打开侧边栏接入。
 
-* **设置页不完整**：`ignoredDomains`、`incognitoEnabled` 已入库但无 UI；`groqModel` 不能选。
-* **分组折叠不同步原生 Chrome**：侧边栏 `collapsed` Set 只藏列表行。
-* **`App.tsx` 过重**：工作区 / 分组弹窗 / 清理 / Stash / 设置约 900 行同文件。再加命令面板或导入导出前，至少把 Stash / Settings / Tab 列表拆开。
-* **`summarizeTabs()` 是空实现**：恒返回 `[]`；真正的 DOM 摘要在 Service Worker 的 `executeScript` 里。
-* **测试面窄**：Vitest 覆盖 url / ai / storage，没有 Service Worker 与 UI 测试。
-* **权限面仍很克制**：无 `content_scripts`、无 `chrome.commands`、无 `alarms`。新调度或全局快捷键都要先写清权限理由。
+仍值得单独记的缺口：
+
+* **`summarizeTabs()` 仍是空实现**：真正的 DOM 摘要在 Service Worker 的 `executeScript` 里。
+* **测试面仍偏共享逻辑**：Vitest 覆盖 url / ai / storage / duplicate / bookmarks / palette，没有完整的 Service Worker 或 side-panel 点击测试。
+* **权限面仍很克制**：无 `content_scripts`。`bookmarks` 只在 optional permissions 里，第一次进入 Bookmarks 再申请。
 
 ---
 
@@ -191,17 +190,13 @@ gantt
     OpenAI-compatible BYOK       :m3b, after m3a, 4d
 ```
 
-### Milestone 0：把现有产品做完整
+### Milestone 0：把现有产品做完整 — 已落地
 
-在加新能力之前关闭已知缺口。
-
-* 修正设置：`ignoredDomains`、无痕开关；分组折叠同步原生 Tab Group。
-* 拆分 [`src/sidepanel/App.tsx`](../../src/sidepanel/App.tsx)：至少 Stash / Settings / 标签列表分开，避免下一阶段无法改。
+* 设置：`ignoredDomains`、无痕开关；分组折叠同步原生 Tab Group。
+* 拆分 [`src/sidepanel/App.tsx`](../../src/sidepanel/App.tsx)：Stash / Settings / 标签列表分开。
 * 文档与实现保持一致：聚类算法、debounce 范围、Built-in AI 已存在、撤销只有一条。
 
-**完成标准**：设置页能管理去重忽略域与无痕；点击分组折叠会反映到 Chrome 原生分组；侧边栏主文件不再承担全部弹窗与列表。
-
-### Milestone 1：数据可以离开浏览器
+### Milestone 1：数据可以离开浏览器 — 已落地
 
 * Stash 导出 JSON（完整元数据）与 Markdown。
 * OneTab 纯文本导入 → 写入 Stash，带校验与上限（现有 50 条）。
@@ -209,7 +204,7 @@ gantt
 
 **完成标准**：用户能把现有 Stash 备份到文件，也能从 OneTab 导出文本迁入；不申请 `unlimitedStorage`，除非有实测配额数据。
 
-### Milestone 2：侧边栏效率
+### Milestone 2：侧边栏效率 — 已落地
 
 * Side Panel 内 `Cmd+K` 命令面板 + 现有本地搜索。无网页注入。若需要全局唤起侧边栏，只用 `chrome.commands` 打开 panel，不画页面浮层。
 * Opt-in Auto-Discard：`alarms` 权限、默认关、复用 cleanup 保护域。
@@ -217,13 +212,19 @@ gantt
 
 **完成标准**：键盘用户可不靠鼠标完成暂存、清理、切窗口；自动休眠默认关且可从设置关闭；未增加 content script。
 
-### Milestone 3：把已有 AI 做诚实
+### Milestone 3：把已有 AI 做诚实 — 已落地（Summarizer 单标签 TL;DR 仍可选未做）
 
 * Built-in AI：availability、下载、失败回退启发式（路径已存在）。
 * 单标签摘要走 `Summarizer`，opt-in。
 * 一个 OpenAI-compatible provider（可替换或扩展当前 Groq）。语义搜索不做。
 
 **完成标准**：无本地模型 / 无 Key 时，分组仍然可用（启发式）；设置里只有「本地自动 / OpenAI-compatible」，而不是五家模型商标。
+
+### 之后已落地（不在原 M0–M3 甘特图里）
+
+* 侧边栏结构重排：顶栏搜索 + 设置，底栏 Tabs / Stash / Bookmarks，组色轨，约 46px 行高。
+* Duplicate Guard 在 URL / `pendingUrl` 就绪后约 200ms 内处理，不再等整页 `complete`。
+* 本地书签 Inbox：optional `bookmarks`、归档预览、去重预览、模糊搜索、可选单页摘要。无 embedding，不拦截书签栏点击。
 
 ### 非目标（本路线图周期内不做）
 

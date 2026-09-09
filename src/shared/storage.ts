@@ -81,7 +81,7 @@ function normalizeStash(value: unknown): StashRecord | null {
 function isActionJournal(value: unknown): value is ActionJournal {
   if (!isRecord(value)) return false;
   return typeof value.actionId === 'string'
-    && (value.type === 'duplicate' || value.type === 'group' || value.type === 'cleanup' || value.type === 'stash' || value.type === 'close')
+    && (value.type === 'duplicate' || value.type === 'group' || value.type === 'cleanup' || value.type === 'stash' || value.type === 'close' || value.type === 'bookmark')
     && typeof value.createdAt === 'number'
     && Array.isArray(value.affectedTabIds)
     && value.affectedTabIds.every((tabId) => typeof tabId === 'number')
@@ -114,8 +114,7 @@ function autoDiscardMinutes(value: unknown): AutoDiscardMinutes {
   return value === 15 || value === 30 || value === 60 || value === 120 ? value : DEFAULT_SETTINGS.autoDiscardMinutes;
 }
 
-export async function loadSettings(): Promise<ZenTabSettings> {
-  const stored = await readStorageKey<unknown>(SETTINGS_KEY, LEGACY_SETTINGS_KEY);
+function settingsFromStored(stored: unknown): ZenTabSettings {
   const safeSettings = isRecord(stored) ? stored : {};
   const migratedProvider = safeSettings.aiProvider === 'groq' || safeSettings.aiProvider === 'openai-compatible'
     ? 'openai-compatible' as const
@@ -144,13 +143,67 @@ export async function loadSettings(): Promise<ZenTabSettings> {
   };
 }
 
+function stashesFromStored(stored: unknown): StashRecord[] {
+  return Array.isArray(stored) ? stored.map(normalizeStash).filter((stash): stash is StashRecord => Boolean(stash)).slice(0, 50) : [];
+}
+
+function apiKeyFromStored(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+export async function loadSettings(): Promise<ZenTabSettings> {
+  return settingsFromStored(await readStorageKey<unknown>(SETTINGS_KEY, LEGACY_SETTINGS_KEY));
+}
+
+export async function loadWorkerBootstrap(
+  read: (keys: string[]) => Promise<Record<string, unknown>> = (keys) => chrome.storage.local.get(keys),
+): Promise<{
+  settings: ZenTabSettings;
+  lastAction: ActionJournal | undefined;
+  stashes: StashRecord[];
+  projectMemory: ProjectMemoryRule[];
+  cloudApiKey: string;
+}> {
+  const result = await read([
+    SETTINGS_KEY, LEGACY_SETTINGS_KEY,
+    STASHES_KEY, LEGACY_STASHES_KEY,
+    ACTION_KEY, LEGACY_ACTION_KEY,
+    GROQ_KEY, LEGACY_GROQ_KEY,
+    PROJECT_MEMORY_KEY,
+  ]);
+  const migrations: Record<string, unknown> = {};
+  const pick = (key: string, legacyKey: string) => {
+    if (result[key] !== undefined) return result[key];
+    if (result[legacyKey] !== undefined) {
+      migrations[key] = result[legacyKey];
+      return result[legacyKey];
+    }
+    return undefined;
+  };
+  const settings = settingsFromStored(pick(SETTINGS_KEY, LEGACY_SETTINGS_KEY));
+  const storedAction = pick(ACTION_KEY, LEGACY_ACTION_KEY);
+  const lastAction = isActionJournal(storedAction) ? storedAction : undefined;
+  const stashes = stashesFromStored(pick(STASHES_KEY, LEGACY_STASHES_KEY));
+  const projectMemory = normalizeProjectMemory(result[PROJECT_MEMORY_KEY]);
+  const cloudApiKey = apiKeyFromStored(pick(GROQ_KEY, LEGACY_GROQ_KEY));
+  if (Object.keys(migrations).length) {
+    try { void chrome.storage.local.set(migrations); } catch { /* First paint can read legacy keys without writing them back. */ }
+  }
+  return {
+    settings,
+    lastAction,
+    stashes,
+    projectMemory: JSON.stringify(projectMemory).length <= MAX_PROJECT_MEMORY_JSON_LENGTH ? projectMemory : [],
+    cloudApiKey,
+  };
+}
+
 export async function saveSettings(settings: ZenTabSettings): Promise<void> {
   await chrome.storage.local.set({ [SETTINGS_KEY]: settings });
 }
 
 export async function loadGroqApiKey(): Promise<string> {
-  const value = await readStorageKey<unknown>(GROQ_KEY, LEGACY_GROQ_KEY);
-  return typeof value === 'string' ? value : '';
+  return apiKeyFromStored(await readStorageKey<unknown>(GROQ_KEY, LEGACY_GROQ_KEY));
 }
 
 export async function saveGroqApiKey(apiKey: string): Promise<void> {
@@ -159,8 +212,7 @@ export async function saveGroqApiKey(apiKey: string): Promise<void> {
 }
 
 export async function listStashes(): Promise<StashRecord[]> {
-  const stored = await readStorageKey<unknown>(STASHES_KEY, LEGACY_STASHES_KEY);
-  return Array.isArray(stored) ? stored.map(normalizeStash).filter((stash): stash is StashRecord => Boolean(stash)).slice(0, 50) : [];
+  return stashesFromStored(await readStorageKey<unknown>(STASHES_KEY, LEGACY_STASHES_KEY));
 }
 
 export async function saveStash(stash: StashRecord): Promise<void> {

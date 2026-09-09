@@ -109,7 +109,7 @@ export type StashRecord = {
 
 export type ActionJournal = {
   actionId: string;
-  type: 'duplicate' | 'group' | 'cleanup' | 'stash' | 'close';
+  type: 'duplicate' | 'group' | 'cleanup' | 'stash' | 'close' | 'bookmark';
   createdAt: number;
   affectedTabIds: number[];
   restoreData?: unknown;
@@ -158,6 +158,47 @@ export type ProjectMemoryRule = {
   createdAt: number;
   updatedAt: number;
   useCount: number;
+};
+
+export type BookmarkRecord = {
+  id: string;
+  parentId: string;
+  title: string;
+  url: string;
+  dateAdded?: number;
+  index?: number;
+  folderPath: string;
+  summary?: string;
+  isInbox: boolean;
+  isBookmarksBar: boolean;
+};
+
+export type BookmarkFolderRecord = {
+  id: string;
+  parentId?: string;
+  title: string;
+  folderPath: string;
+  isInbox: boolean;
+  isSpecialRoot: boolean;
+  isBookmarksBar: boolean;
+};
+
+export type BookmarkFolderSuggestion = {
+  folderId: string;
+  folderTitle: string;
+  confidence: 'high' | 'medium' | 'low';
+  reason: string;
+};
+
+export type BookmarkDuplicateGroup = {
+  canonicalUrl: string;
+  keepId: string;
+  removeIds: string[];
+};
+
+export type BookmarkSearchResult = {
+  bookmark: BookmarkRecord;
+  score: number;
 };
 
 export type GroupUndoData =
@@ -218,7 +259,13 @@ export type GroupScanProgress = {
 
 export type ZenTabMessage =
   | { type: 'GET_SNAPSHOT' }
-  | { type: 'RUN_GROUP_ANALYSIS'; windowId: number; deepScanAll?: boolean }
+  | { type: 'GET_BOOKMARK_TREE' }
+  | { type: 'FILE_BOOKMARKS'; bookmarkIds: string[]; folderId: string }
+  | { type: 'APPLY_BOOKMARK_DEDUP'; groups: Array<{ keepId: string; removeIds: string[] }> }
+  | { type: 'SUGGEST_BOOKMARK_FILE'; bookmarkId: string }
+  | { type: 'RUN_GROUP_ANALYSIS'; windowId: number; deepScanAll?: boolean; tabIds?: number[] }
+  | { type: 'GROUP_TABS'; windowId: number; tabIds: number[]; title?: string; color?: GroupColor }
+  | { type: 'CREATE_BOOKMARKS'; folderId?: string; tabs: Array<{ title: string; url: string }> }
   | { type: 'APPLY_GROUP_PROPOSAL'; proposal: GroupProposal }
   | { type: 'RUN_CLEANUP_ANALYSIS'; windowId: number }
   | { type: 'APPLY_CLEANUP'; proposal: CleanupProposal; tabIds: number[] }
@@ -244,6 +291,8 @@ export type ZenTabMessage =
 
 export type ZenTabEvent =
   | { type: 'SNAPSHOT_UPDATED'; snapshot: ZenTabSnapshot }
+  | { type: 'BOOKMARKS_UPDATED' }
+  | { type: 'BOOKMARK_FILING_SUGGESTED'; bookmarkId: string; title: string; url: string; suggestion: BookmarkFolderSuggestion | null }
   | { type: 'TOAST'; toast: ToastMessage }
   | { type: 'GROUP_SCAN_PROGRESS'; windowId: number; scanned: number; total: number; mode: 'adaptive' | 'full' }
   | { type: 'RESTORE_PROGRESS'; stashId: string; completed: number; total: number };

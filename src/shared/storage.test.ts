@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { clearProjectMemory, listStashes, loadProjectMemory, loadSettings, saveProjectMemory } from './storage';
+import { clearProjectMemory, listStashes, loadProjectMemory, loadSettings, loadWorkerBootstrap, saveProjectMemory } from './storage';
 
 type MockStorage = Record<string, unknown>;
 
@@ -69,6 +69,21 @@ describe('storage validation', () => {
     expect(rules).toHaveLength(1);
     expect(rules[0].tokens).toContain('shared');
     expect(rules[0].tokens.every((token) => token.length <= 80)).toBe(true);
+  });
+
+  it('reads bootstrap state in one storage get', async () => {
+    storage['zen-tab.settings'] = { language: 'zh', theme: 'dark' };
+    storage['zen-tab.stashes'] = [
+      { version: 1, id: 'valid', name: 'Valid', createdAt: 1, sourceWindowId: 42, tabs: [{ url: 'https://example.com', title: 'Example', index: 0, groupId: -1 }] },
+    ];
+    storage['zen-tab.project-memory'] = [{ id: 'rule', projectName: 'Work', tokens: ['work'], createdAt: 1, updatedAt: 2, useCount: 1 }];
+    storage['zen-tab.groq-key'] = 'sk-test';
+    const bootstrap = await loadWorkerBootstrap();
+    expect(bootstrap.settings.language).toBe('zh');
+    expect(bootstrap.settings.theme).toBe('dark');
+    expect(bootstrap.stashes).toHaveLength(1);
+    expect(bootstrap.projectMemory[0].projectName).toBe('Work');
+    expect(bootstrap.cloudApiKey).toBe('sk-test');
   });
 
   it('limits project memory rules and can clear them', async () => {

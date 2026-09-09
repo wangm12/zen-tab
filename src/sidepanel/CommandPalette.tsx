@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { AppWindow, Archive, Globe2, ListFilter, Search, Settings2, Sparkles, Undo2, X } from 'lucide-react';
-import { TabRecord, WindowSnapshot } from '../shared/types';
+import { AppWindow, Archive, Bookmark, Globe2, ListFilter, Search, Settings2, Sparkles, Undo2, X } from 'lucide-react';
+import { BookmarkRecord, StashRecord, TabRecord, WindowSnapshot } from '../shared/types';
 import { Translator } from './i18n';
 import { PaletteEntry, buildPaletteEntries } from './palette';
 import { useFocusTrap } from './ui';
 
-function PaletteIcon({ item }: { item: PaletteEntry }) {
+export function PaletteIcon({ item }: { item: PaletteEntry }) {
   if (item.commandId === 'jump-tab') {
     return item.favIconUrl
       ? <img src={item.favIconUrl} alt="" className="palette-favicon" />
@@ -16,22 +16,25 @@ function PaletteIcon({ item }: { item: PaletteEntry }) {
   if (item.commandId === 'settings') return <Settings2 size={13} />;
   if (item.commandId === 'undo') return <Undo2 size={13} />;
   if (item.commandId === 'search') return <Search size={13} />;
-  if (item.commandId.startsWith('stash') || item.commandId === 'export-window') return <Archive size={13} />;
+  if (item.commandId === 'bookmarks' || item.commandId === 'jump-bookmark') return <Bookmark size={13} />;
+  if (item.commandId === 'jump-stash' || item.commandId.startsWith('stash') || item.commandId === 'export-window') return <Archive size={13} />;
   return <Sparkles size={13} />;
 }
 
-export function CommandPalette({ open, windows, t, onClose, onRun }: {
+export function CommandPalette({ open, windows, bookmarks, stashes, t, onClose, onRun }: {
   open: boolean;
   windows: WindowSnapshot[];
+  bookmarks?: BookmarkRecord[];
+  stashes?: StashRecord[];
   t: Translator;
   onClose: () => void;
-  onRun: (commandId: string, tab?: TabRecord, windowId?: number) => void;
+  onRun: (commandId: string, tab?: TabRecord, windowId?: number, url?: string, stashId?: string) => void;
 }) {
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
   const sheetRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const commands = useMemo(() => buildPaletteEntries(windows, query, t), [query, t, windows]);
+  const commands = useMemo(() => buildPaletteEntries(windows, query, t, bookmarks, stashes), [bookmarks, query, stashes, t, windows]);
   useFocusTrap(sheetRef, onClose, inputRef, open);
 
   useEffect(() => {
@@ -50,7 +53,7 @@ export function CommandPalette({ open, windows, t, onClose, onRun }: {
   if (!open) return null;
 
   const runItem = (item: PaletteEntry) => {
-    onRun(item.commandId, item.tab, item.windowId);
+    onRun(item.commandId, item.tab, item.windowId, item.url, item.stashId);
     onClose();
   };
 

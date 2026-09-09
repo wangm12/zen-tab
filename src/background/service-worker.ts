@@ -1,10 +1,35 @@
 import { buildProjectMemoryRules, cloudProposalForSidePanel, createAIProvider, heuristicCleanup } from '../shared/ai';
 import { shouldAutoDiscard, shouldSkipDiscardAfterInspect } from '../shared/discard';
+import {
+  canCompareDuplicate,
+  DUPLICATE_REDIRECT_GRACE_MS,
+  isRedirectGraceElapsed,
+  pickDuplicateCandidate,
+  shouldDeferDuplicateCheck,
+} from '../shared/duplicate';
+import {
+  BookmarkFileMove,
+  canRestoreBookmarkIntoParent,
+  existingCanonicalUrlsInBookmarkParent,
+  flattenBookmarkTree,
+  planBookmarkCreates,
+  shouldRestoreFiledBookmark,
+  suggestBookmarkFolder,
+  validateBookmarkDedupGroups,
+} from '../shared/bookmarks';
+import {
+  restoreCreatedBookmarkIds,
+  shouldIgnoreBookmarkCreated,
+  withBookmarkCreatedFilingSuppressed,
+} from '../shared/bookmark-create-undo';
+import { isEligibleProposalTab, selectEligibleGroupTabs, validateGroupTabsInput } from '../shared/group-tabs';
+import { canUseBookmarksApi } from '../shared/optional-api';
+import { groupRecordFromChrome, tabRecordFromChrome } from '../shared/tab-record';
 import { createId } from '../shared/ids';
 import { hostPermissionForBaseUrl } from '../shared/openai';
 import { extractGroupingPageTextInPage } from '../shared/page-text';
 import { isCleanupProtectedTab, isExplicitlyCloseableTab, restoreDescriptorKey, restoreInsertIndex } from '../shared/tab-ops';
-import { canonicalizeUrl, displayHostname, getHostname, isSpecialUrl } from '../shared/url';
+import { displayHostname, isSpecialUrl } from '../shared/url';
 import {
   ActionJournal,
   DEFAULT_SETTINGS,
@@ -23,15 +48,13 @@ import {
   ProjectMemoryRule,
   TabRestoreDescriptor,
   RecentSession,
+  BookmarkRecord,
 } from '../shared/types';
 import {
   clearLastAction,
   deleteStash,
   listStashes,
-  loadGroqApiKey,
-  loadLastAction,
-  loadProjectMemory,
-  loadSettings,
+  loadWorkerBootstrap,
   clearProjectMemory,
   saveGroqApiKey,
   saveLastAction,
@@ -46,6 +69,7 @@ const canonicalIndex = new Map<string, Set<number>>();
 const groupIndex = new Map<number, TabGroupRecord>();
 const creationTimes = new Map<number, number>();
 const pendingDuplicateChecks = new Map<number, ReturnType<typeof setTimeout>>();
+const lastUrlChangeAt = new Map<number, number>();
 const handledDuplicateTabs = new Set<number>();
 const startupTabIds = new Set<number>();
 const ADAPTIVE_SUMMARY_LIMIT = 32;
@@ -63,7 +87,13 @@ type DuplicateUndoData = {
   };
 };
 
+type BookmarkUndoData =
+  | { kind: 'file'; moves: BookmarkFileMove[] }
+  | { kind: 'dedup'; removed: Array<{ id: string; title: string; url: string; parentId: string; index: number }> }
+  | { kind: 'create'; created: Array<{ id: string }> };
+
 const AUTO_DISCARD_ALARM = 'zen-tab-auto-discard';
+const PENDING_BOOKMARK_FILING_KEY = 'zen-tab.pending-bookmark-filing';
 let settings: ZenTabSettings = DEFAULT_SETTINGS;
 let lastAction: ActionJournal | undefined;
 let initialized = false;
@@ -76,6 +106,9 @@ let projectMemory: ProjectMemoryRule[] = [];
 let snapshotCache: ZenTabSnapshot | undefined;
 let snapshotDirty = true;
 let mutationQueue = Promise.resolve();
+let suppressBookmarkCreatedFiling = 0;
+let bookmarkMutationDepth = 0;
+let bookmarkBroadcastTimer: ReturnType<typeof setTimeout> | undefined;
 
 function runMutation<T>(operation: () => Promise<T>): Promise<T> {
   const next = mutationQueue.then(operation, operation);
@@ -88,26 +121,7 @@ function asTabRecord(tab: chrome.tabs.Tab): TabRecord {
   const existing = tabIndex.get(tab.id);
   const createdAt = existing?.createdAt ?? creationTimes.get(tab.id) ?? Date.now();
   creationTimes.set(tab.id, createdAt);
-  return {
-    tabId: tab.id,
-    windowId: tab.windowId,
-    incognito: tab.incognito,
-    url: tab.url ?? tab.pendingUrl ?? '',
-    canonicalUrl: canonicalizeUrl(tab.url ?? tab.pendingUrl),
-    title: tab.title ?? 'Untitled tab',
-    favIconUrl: tab.favIconUrl,
-    groupId: tab.groupId ?? -1,
-    pinned: Boolean(tab.pinned),
-    active: Boolean(tab.active),
-    audible: Boolean(tab.audible),
-    discarded: Boolean(tab.discarded),
-    autoDiscardable: tab.autoDiscardable !== false,
-    muted: Boolean(tab.mutedInfo?.muted),
-    index: tab.index,
-    status: tab.status,
-    lastAccessed: tab.lastAccessed,
-    createdAt,
-  };
+  return tabRecordFromChrome(tab, createdAt);
 }
 
 function scopeKey(tab: TabRecord): string {
@@ -128,6 +142,7 @@ function removeWindowState(windowId: number): void {
     const pending = pendingDuplicateChecks.get(tabId);
     if (pending) clearTimeout(pending);
     pendingDuplicateChecks.delete(tabId);
+    lastUrlChangeAt.delete(tabId);
     removeFromCanonicalIndex(tab);
     tabIndex.delete(tabId);
     creationTimes.delete(tabId);
@@ -153,42 +168,41 @@ async function initialize(): Promise<void> {
   if (initialized) return;
   if (initializing) return initializing;
   initializing = (async () => {
-    settings = await loadSettings();
-    lastAction = await loadLastAction();
-    stashesCache = await listStashes();
-    projectMemory = await loadProjectMemory();
-    cloudApiKey = await loadGroqApiKey();
-    try {
-      focusedWindowId = (await chrome.windows.getLastFocused()).id ?? chrome.windows.WINDOW_ID_NONE;
-    } catch {
-      focusedWindowId = chrome.windows.WINDOW_ID_NONE;
+    const [bootstrap, focused] = await Promise.all([
+      loadWorkerBootstrap(),
+      chrome.windows.getLastFocused()
+        .then((window) => window.id ?? chrome.windows.WINDOW_ID_NONE)
+        .catch(() => chrome.windows.WINDOW_ID_NONE),
+    ]);
+    settings = bootstrap.settings;
+    lastAction = bootstrap.lastAction;
+    stashesCache = bootstrap.stashes;
+    projectMemory = bootstrap.projectMemory;
+    cloudApiKey = bootstrap.cloudApiKey;
+    focusedWindowId = focused;
+
+    const queryFocusedOnly = focusedWindowId !== chrome.windows.WINDOW_ID_NONE;
+    const [tabs, groups] = await Promise.all([
+      queryFocusedOnly ? chrome.tabs.query({ windowId: focusedWindowId }) : chrome.tabs.query({}),
+      (queryFocusedOnly ? chrome.tabGroups.query({ windowId: focusedWindowId }) : chrome.tabGroups.query({})).catch(() => []),
+    ]);
+    for (const tab of tabs) {
+      exemptFromDuplicateGuard(tab.id);
+      indexTab(asTabRecord(tab));
     }
-    const allTabs = await chrome.tabs.query({});
-    for (const tab of allTabs) exemptFromDuplicateGuard(tab.id);
-    const tabs = focusedWindowId === chrome.windows.WINDOW_ID_NONE
-      ? allTabs
-      : allTabs.filter((tab) => tab.windowId === focusedWindowId);
-    for (const tab of tabs) indexTab(asTabRecord(tab));
-    try {
-      const groups = focusedWindowId === chrome.windows.WINDOW_ID_NONE
-        ? await chrome.tabGroups.query({})
-        : await chrome.tabGroups.query({ windowId: focusedWindowId });
-      for (const group of groups) {
-        groupIndex.set(group.id, {
-          groupId: group.id,
-          windowId: group.windowId,
-          title: group.title ?? '',
-          color: group.color,
-          collapsed: Boolean(group.collapsed),
-        });
-      }
-    } catch {
-      // Some Chrome versions can return an empty group list during startup.
+    for (const group of groups) {
+      groupIndex.set(group.id, {
+        groupId: group.id,
+        windowId: group.windowId,
+        title: group.title ?? '',
+        color: group.color,
+        collapsed: Boolean(group.collapsed),
+      });
     }
     initialized = true;
     snapshotDirty = true;
-    await syncAutoDiscardAlarm();
-    if (focusedWindowId !== chrome.windows.WINDOW_ID_NONE) void hydrateRemainingWindows();
+    void syncAutoDiscardAlarm();
+    if (queryFocusedOnly) void hydrateRemainingWindows();
   })();
   await initializing;
 }
@@ -271,39 +285,181 @@ function scheduleSnapshotBroadcast(): void {
   }, 75);
 }
 
-function isIgnored(tab: TabRecord): boolean {
-  const host = getHostname(tab.url);
-  return settings.ignoredDomains.some((domain) => host === domain || host.endsWith(`.${domain}`));
+function scheduleBookmarksUpdated(): void {
+  if (bookmarkMutationDepth > 0) return;
+  if (bookmarkBroadcastTimer) clearTimeout(bookmarkBroadcastTimer);
+  bookmarkBroadcastTimer = setTimeout(() => {
+    bookmarkBroadcastTimer = undefined;
+    sendEvent({ type: 'BOOKMARKS_UPDATED' });
+  }, 100);
 }
 
-function canCompare(tab: TabRecord): boolean {
-  if (!settings.duplicateEnabled || !tab.canonicalUrl || tab.pinned || isSpecialUrl(tab.url) || isIgnored(tab)) return false;
-  if (tab.incognito && !settings.incognitoEnabled) return false;
-  return true;
-}
-
-function duplicateCandidate(newTab: TabRecord): TabRecord | undefined {
-  if (!newTab.canonicalUrl) return undefined;
-  const ids = canonicalIndex.get(scopeKey(newTab));
-  if (!ids) return undefined;
-  const candidates = [...ids]
-    .map((id) => tabIndex.get(id))
-    .filter((tab): tab is TabRecord => Boolean(tab && tab.tabId !== newTab.tabId && tab.canonicalUrl && !isSpecialUrl(tab.url) && !isIgnored(tab)))
-    .filter((tab) => settings.duplicateScope === 'all-normal-windows' || tab.windowId === newTab.windowId);
-  candidates.sort((left, right) => {
-    const pinnedScore = Number(right.pinned) - Number(left.pinned);
-    if (pinnedScore) return pinnedScore;
-    const sameWindowScore = Number(right.windowId === newTab.windowId) - Number(left.windowId === newTab.windowId);
-    if (sameWindowScore) return sameWindowScore;
-    return (right.lastAccessed ?? right.createdAt) - (left.lastAccessed ?? left.createdAt);
-  });
-  return candidates[0];
+async function runBookmarkBatch<T>(operation: () => Promise<T>): Promise<T> {
+  bookmarkMutationDepth += 1;
+  try {
+    return await operation();
+  } finally {
+    bookmarkMutationDepth -= 1;
+    if (bookmarkMutationDepth === 0) scheduleBookmarksUpdated();
+  }
 }
 
 async function persistAction(action: ActionJournal): Promise<void> {
   lastAction = action;
   snapshotDirty = true;
   await saveLastAction(action);
+}
+
+async function checkpointBookmarkUndo(action: ActionJournal, data: BookmarkUndoData): Promise<void> {
+  const remaining = data.kind === 'file' ? data.moves.length : data.kind === 'dedup' ? data.removed.length : data.created.length;
+  if (remaining > 0) {
+    await persistAction({ ...action, restoreData: data });
+    return;
+  }
+  await clearLastAction();
+  lastAction = undefined;
+  snapshotDirty = true;
+}
+
+async function hasBookmarksPermission(): Promise<boolean> {
+  try {
+    return await chrome.permissions.contains({ permissions: ['bookmarks'] });
+  } catch {
+    return false;
+  }
+}
+
+async function getBookmarkTreeData(): Promise<{
+  granted: boolean;
+  bookmarks: ReturnType<typeof flattenBookmarkTree>['bookmarks'];
+  folders: ReturnType<typeof flattenBookmarkTree>['folders'];
+}> {
+  if (!(await hasBookmarksPermission())) return { granted: false, bookmarks: [], folders: [] };
+  const flattened = flattenBookmarkTree(await chrome.bookmarks.getTree());
+  return { granted: true, ...flattened };
+}
+
+async function fileBookmarks(bookmarkIds: string[], folderId: string): Promise<{ moved: number }> {
+  const uniqueIds = [...new Set(bookmarkIds)];
+  const moves = await Promise.all(uniqueIds.map(async (id) => {
+    const node = (await chrome.bookmarks.get(id))[0];
+    if (!node?.url || !node.parentId) throw new Error('A selected bookmark is no longer available.');
+    return { id, fromParentId: node.parentId, fromIndex: node.index ?? 0, toParentId: folderId };
+  }));
+  const completed: typeof moves = [];
+  const persistCompleted = async () => {
+    if (!completed.length) return;
+    await persistAction({
+      actionId: createId('action'),
+      type: 'bookmark',
+      createdAt: Date.now(),
+      affectedTabIds: [],
+      restoreData: { kind: 'file', moves: completed } satisfies BookmarkUndoData,
+      expiresAt: Date.now() + 30_000,
+    });
+  };
+  await runBookmarkBatch(async () => {
+    try {
+      for (const move of moves) {
+        await chrome.bookmarks.move(move.id, { parentId: folderId });
+        completed.push(move);
+      }
+    } catch (error) {
+      await persistCompleted();
+      throw error;
+    }
+  });
+  await persistCompleted();
+  return { moved: completed.length };
+}
+
+async function applyBookmarkDedup(groups: Array<{ keepId: string; removeIds: string[] }>): Promise<{ removed: number }> {
+  const live = flattenBookmarkTree(await chrome.bookmarks.getTree()).bookmarks;
+  const validatedGroups = validateBookmarkDedupGroups(live, groups);
+  const keepIds = new Set(validatedGroups.map((group) => group.keepId));
+  const removeIds = [...new Set(validatedGroups.flatMap((group) => group.removeIds))].filter((id) => !keepIds.has(id));
+  const liveById = new Map(live.map((bookmark) => [bookmark.id, bookmark]));
+  const removed: Extract<BookmarkUndoData, { kind: 'dedup' }>['removed'] = [];
+  const persistRemoved = async () => {
+    if (!removed.length) return;
+    await persistAction({
+      actionId: createId('action'),
+      type: 'bookmark',
+      createdAt: Date.now(),
+      affectedTabIds: [],
+      restoreData: { kind: 'dedup', removed } satisfies BookmarkUndoData,
+      expiresAt: Date.now() + 30_000,
+    });
+  };
+  await runBookmarkBatch(async () => {
+    try {
+      for (const id of removeIds) {
+        const node = liveById.get(id);
+        if (!node) continue;
+        await chrome.bookmarks.remove(id);
+        removed.push({
+          id,
+          title: node.title,
+          url: node.url,
+          parentId: node.parentId,
+          index: node.index ?? 0,
+        });
+      }
+    } catch (error) {
+      await persistRemoved();
+      throw error;
+    }
+  });
+  await persistRemoved();
+  return { removed: removed.length };
+}
+
+async function bookmarkSuggestion(bookmarkId: string): Promise<{
+  bookmark: BookmarkRecord;
+  suggestion: ReturnType<typeof suggestBookmarkFolder>;
+} | null> {
+  const data = await getBookmarkTreeData();
+  if (!data.granted) return null;
+  const bookmark = data.bookmarks.find((item) => item.id === bookmarkId);
+  if (!bookmark) return null;
+  return {
+    bookmark,
+    suggestion: suggestBookmarkFolder(bookmark, data.bookmarks, data.folders, projectMemory),
+  };
+}
+
+async function handleCreatedBookmark(bookmarkId: string): Promise<void> {
+  await initialize();
+  const result = await bookmarkSuggestion(bookmarkId);
+  if (!result?.bookmark.isInbox) return;
+  const { bookmark, suggestion } = result;
+  const event: Extract<ZenTabEvent, { type: 'BOOKMARK_FILING_SUGGESTED' }> = {
+    type: 'BOOKMARK_FILING_SUGGESTED',
+    bookmarkId: bookmark.id,
+    title: bookmark.title,
+    url: bookmark.url,
+    suggestion,
+  };
+  const sidePanelOpen = await chrome.runtime.getContexts({ contextTypes: [chrome.runtime.ContextType.SIDE_PANEL] })
+    .then((contexts) => contexts.length > 0)
+    .catch(() => false);
+  if (suggestion?.confidence === 'high' && sidePanelOpen) {
+    const result = await fileBookmarks([bookmark.id], suggestion.folderId);
+    sendEvent({
+      type: 'TOAST',
+      toast: {
+        id: lastAction?.actionId ?? createId('toast'),
+        tone: result.moved > 0 ? 'success' : 'neutral',
+        message: settings.language === 'zh'
+          ? `书签已归档到 ${suggestion.folderTitle}。`
+          : `Bookmark filed in ${suggestion.folderTitle}.`,
+        ...(result.moved > 0 ? { action: 'undo' as const } : {}),
+      },
+    });
+    return;
+  }
+  if (sidePanelOpen) sendEvent(event);
+  else await chrome.storage.session.set({ [PENDING_BOOKMARK_FILING_KEY]: event });
 }
 
 function createTabInput(tab: TabRecord, summary?: string): ProjectTabInput {
@@ -336,8 +492,16 @@ function duplicateToastCopy(isForeground: boolean, host: string): string {
 
 async function maybeHandleDuplicate(tabId: number): Promise<void> {
   const tab = tabIndex.get(tabId);
-  if (!tab || startupTabIds.has(tabId) || tab.status === 'loading' || !canCompare(tab) || handledDuplicateTabs.has(tabId)) return;
-  const candidate = duplicateCandidate(tab);
+  if (!tab || startupTabIds.has(tabId) || handledDuplicateTabs.has(tabId)) return;
+  if (shouldDeferDuplicateCheck(tab)
+    || !canCompareDuplicate(tab, settings)
+    || !isRedirectGraceElapsed(lastUrlChangeAt.get(tabId), Date.now())) return;
+  const ids = canonicalIndex.get(scopeKey(tab));
+  const others = ids
+    ? [...ids].map((id) => tabIndex.get(id)).filter((other): other is TabRecord => Boolean(other))
+    : [];
+  const pickedCandidate = pickDuplicateCandidate(tab, others, settings);
+  const candidate = pickedCandidate ? tabIndex.get(pickedCandidate.tabId) : undefined;
   if (!candidate) return;
   handledDuplicateTabs.add(tabId);
   const isForeground = tab.active;
@@ -360,12 +524,12 @@ async function maybeHandleDuplicate(tabId: number): Promise<void> {
   };
   try {
     await chrome.tabs.remove(tab.tabId);
-    await persistAction(action);
   } catch {
     handledDuplicateTabs.delete(tabId);
     return;
   }
   try {
+    await persistAction(action);
     if (isForeground) {
       await chrome.windows.update(candidate.windowId, { focused: true });
       await chrome.tabs.update(candidate.tabId, { active: true });
@@ -395,22 +559,17 @@ async function maybeHandleDuplicate(tabId: number): Promise<void> {
 }
 
 function scheduleDuplicateCheck(tabId: number): void {
+  lastUrlChangeAt.set(tabId, Date.now());
   const previous = pendingDuplicateChecks.get(tabId);
   if (previous) clearTimeout(previous);
   pendingDuplicateChecks.set(tabId, setTimeout(() => {
     pendingDuplicateChecks.delete(tabId);
     void runMutation(() => maybeHandleDuplicate(tabId)).catch(() => undefined);
-  }, 50));
+  }, DUPLICATE_REDIRECT_GRACE_MS));
 }
 
 function tabGroupFromChrome(group: chrome.tabGroups.TabGroup): TabGroupRecord {
-  return {
-    groupId: group.id,
-    windowId: group.windowId,
-    title: group.title ?? '',
-    color: group.color,
-    collapsed: Boolean(group.collapsed),
-  };
+  return groupRecordFromChrome(group);
 }
 
 function summaryPriority(input: ProjectTabInput): number {
@@ -423,11 +582,12 @@ function summaryPriority(input: ProjectTabInput): number {
   return priority;
 }
 
-async function prepareGroupInputs(windowId: number, deepScanAll: boolean): Promise<{ inputs: ProjectTabInput[]; deepAnalysisUsed: boolean; proposal?: GroupProposal }> {
+async function prepareGroupInputs(windowId: number, deepScanAll: boolean, tabIds?: number[]): Promise<{ inputs: ProjectTabInput[]; deepAnalysisUsed: boolean; proposal?: GroupProposal }> {
   await initialize();
-  const eligible = [...tabIndex.values()]
-    .filter((tab) => tab.windowId === windowId && (settings.incognitoEnabled || !tab.incognito) && !tab.pinned && tab.groupId === -1 && !isSpecialUrl(tab.url))
-    .sort((left, right) => left.index - right.index);
+  const eligible = selectEligibleGroupTabs([...tabIndex.values()], windowId, {
+    tabIds,
+    incognitoEnabled: settings.incognitoEnabled,
+  });
   const inputs = eligible.map((tab) => createTabInput(tab));
   const finalize = async (preparedInputs: ProjectTabInput[], deepAnalysisUsed: boolean) => {
     if (settings.aiProvider !== 'openai-compatible' || !cloudApiKey) return { inputs: preparedInputs, deepAnalysisUsed };
@@ -500,6 +660,7 @@ async function applyGroupProposal(proposal: GroupProposal): Promise<{ groupsCrea
   if (proposal.sourceWindowId == null || !proposal.analyzedTabIds?.length || Date.now() - proposal.createdAt > 5 * 60_000) {
     throw new Error('This project proposal is stale. Run the analysis again.');
   }
+  const sourceWindowId = proposal.sourceWindowId;
   const analyzed = new Set(proposal.analyzedTabIds);
   const seen = new Set<number>();
   const validatedGroups: Array<{ name: string; tabIds: number[] }> = [];
@@ -508,7 +669,7 @@ async function applyGroupProposal(proposal: GroupProposal): Promise<{ groupsCrea
     if (!name || name.length > 42 || group.tabIds.length < 2) throw new Error('The project proposal contains an invalid group.');
     const tabIds = group.tabIds.filter((tabId) => {
       const tab = tabIndex.get(tabId);
-      if (!tab || !analyzed.has(tabId) || seen.has(tabId) || tab.windowId !== proposal.sourceWindowId || tab.pinned || tab.groupId !== -1 || (tab.incognito && !settings.incognitoEnabled)) return false;
+      if (!isEligibleProposalTab(tab, { tabId, analyzed, seen, sourceWindowId, incognitoEnabled: settings.incognitoEnabled })) return false;
       seen.add(tabId);
       return true;
     });
@@ -552,6 +713,70 @@ async function applyGroupProposal(proposal: GroupProposal): Promise<{ groupsCrea
     expiresAt: Date.now() + 30_000,
   });
   return { groupsCreated: validatedGroups.length };
+}
+
+async function groupSelectedTabs(windowId: number, requestedIds: number[], title?: string, color?: TabGroupRecord['color']): Promise<{ groupId: number; tabIds: number[] }> {
+  const tabs = [...tabIndex.values()];
+  const validated = validateGroupTabsInput(tabs, requestedIds);
+  if (validated.windowId !== windowId) throw new Error('Tabs must share the same window.');
+  const groupId = await chrome.tabs.group({ tabIds: validated.tabIds as [number, ...number[]] });
+  if (title !== undefined || color !== undefined) {
+    await chrome.tabGroups.update(groupId, {
+      ...(title !== undefined ? { title } : {}),
+      ...(color !== undefined ? { color } : {}),
+    });
+  }
+  await persistAction({
+    actionId: createId('action'),
+    type: 'group',
+    createdAt: Date.now(),
+    affectedTabIds: validated.tabIds,
+    restoreData: { group: { kind: 'proposal', ungroupTabIds: validated.tabIds, groupIds: [groupId] } satisfies GroupUndoData },
+    expiresAt: Date.now() + 30_000,
+  });
+  return { groupId, tabIds: validated.tabIds };
+}
+
+async function createBookmarksFromTabs(folderId: string | undefined, tabs: Array<{ title: string; url: string }>): Promise<{ created: number; skipped: number }> {
+  if (!(await hasBookmarksPermission())) throw new Error('Bookmark access is required to file these tabs.');
+  const flattened = flattenBookmarkTree(await chrome.bookmarks.getTree());
+  const existing = existingCanonicalUrlsInBookmarkParent(flattened.bookmarks, flattened.folders, folderId);
+  const { toCreate, skipped } = planBookmarkCreates(tabs, existing);
+  const created: Array<{ id: string }> = [];
+  const persistCreated = async () => {
+    if (!created.length) return;
+    await persistAction({
+      actionId: createId('action'),
+      type: 'bookmark',
+      createdAt: Date.now(),
+      affectedTabIds: [],
+      restoreData: { kind: 'create', created: [...created] } satisfies BookmarkUndoData,
+      expiresAt: Date.now() + 30_000,
+    });
+  };
+  return withBookmarkCreatedFilingSuppressed(
+    toCreate.length,
+    (delta) => { suppressBookmarkCreatedFiling += delta; },
+    async () => {
+      await runBookmarkBatch(async () => {
+        try {
+          for (const tab of toCreate) {
+            const node = await chrome.bookmarks.create({
+              ...(folderId ? { parentId: folderId } : {}),
+              title: tab.title,
+              url: tab.url,
+            });
+            created.push({ id: node.id });
+          }
+        } catch (error) {
+          await persistCreated();
+          throw error;
+        }
+      });
+      await persistCreated();
+      return { created: created.length, skipped };
+    },
+  );
 }
 
 async function updateGroup(groupId: number, action: 'rename' | 'color' | 'collapse', title?: string, color?: TabGroupRecord['color'], collapsed?: boolean): Promise<{ updated: true }> {
@@ -878,7 +1103,19 @@ async function restoreAction(): Promise<boolean> {
     lastAction = undefined;
     return false;
   }
-  const data = lastAction.restoreData as { stashId?: string; tabs?: TabRestoreDescriptor[]; ungroupTabIds?: number[]; group?: GroupUndoData; kind?: 'duplicate'; newTab?: TabRestoreDescriptor; candidate?: DuplicateUndoData['candidate']; incognito?: boolean } | undefined;
+  const data = lastAction.restoreData as {
+    stashId?: string;
+    tabs?: TabRestoreDescriptor[];
+    ungroupTabIds?: number[];
+    group?: GroupUndoData;
+    kind?: 'duplicate' | 'file' | 'dedup' | 'create';
+    newTab?: TabRestoreDescriptor;
+    candidate?: DuplicateUndoData['candidate'];
+    incognito?: boolean;
+    moves?: Extract<BookmarkUndoData, { kind: 'file' }>['moves'];
+    removed?: Extract<BookmarkUndoData, { kind: 'dedup' }>['removed'];
+    created?: Extract<BookmarkUndoData, { kind: 'create' }>['created'];
+  } | undefined;
   if (lastAction.type === 'stash' && data?.tabs?.length) {
     const result = await restoreDescriptors(data.tabs, data.tabs[0].windowId, true, undefined, Boolean(data.incognito));
     if (result.failed > 0) throw new Error('Some stashed tabs could not be restored.');
@@ -933,6 +1170,70 @@ async function restoreAction(): Promise<boolean> {
     await clearLastAction();
     lastAction = undefined;
     return true;
+  }
+  if (lastAction.type === 'bookmark' && data?.kind === 'file' && data.moves?.length) {
+    const action = lastAction;
+    const remaining = [...data.moves];
+    return runBookmarkBatch(async () => {
+      while (remaining.length) {
+        const move = remaining[0];
+        try {
+          const liveNode = (await chrome.bookmarks.get(move.id))[0];
+          if (shouldRestoreFiledBookmark(move, liveNode)) {
+            await chrome.bookmarks.move(move.id, { parentId: move.fromParentId, index: move.fromIndex });
+          }
+          remaining.shift();
+          await checkpointBookmarkUndo(action, { kind: 'file', moves: [...remaining] });
+        } catch (error) {
+          await checkpointBookmarkUndo(action, { kind: 'file', moves: [...remaining] });
+          throw error;
+        }
+      }
+      return true;
+    });
+  }
+  if (lastAction.type === 'bookmark' && data?.kind === 'create' && data.created?.length) {
+    const action = lastAction;
+    return runBookmarkBatch(async () => {
+      await restoreCreatedBookmarkIds(data.created ?? [], {
+        get: (id) => chrome.bookmarks.get(id),
+        remove: (id) => chrome.bookmarks.remove(id),
+        checkpoint: (remaining) => checkpointBookmarkUndo(action, { kind: 'create', created: remaining }),
+      });
+      return true;
+    });
+  }
+  if (lastAction.type === 'bookmark' && data?.kind === 'dedup' && data.removed?.length) {
+    const action = lastAction;
+    const remaining = [...data.removed].sort((left, right) => left.index - right.index);
+    return runBookmarkBatch(async () => {
+      const folders = flattenBookmarkTree(await chrome.bookmarks.getTree()).folders;
+      const liveFolders = new Map(folders.map((folder) => [folder.id, { id: folder.id, title: folder.title }]));
+      suppressBookmarkCreatedFiling += 1;
+      try {
+        while (remaining.length) {
+          const removed = remaining[0];
+          try {
+            if (canRestoreBookmarkIntoParent(removed.parentId, liveFolders.get(removed.parentId))) {
+              await chrome.bookmarks.create({
+                parentId: removed.parentId,
+                index: removed.index,
+                title: removed.title,
+                url: removed.url,
+              });
+            }
+            remaining.shift();
+            await checkpointBookmarkUndo(action, { kind: 'dedup', removed: [...remaining] });
+          } catch (error) {
+            await checkpointBookmarkUndo(action, { kind: 'dedup', removed: [...remaining] });
+            throw error;
+          }
+        }
+      } finally {
+        suppressBookmarkCreatedFiling -= 1;
+      }
+      return true;
+    });
   }
   if (lastAction.type === 'duplicate' && data?.kind === 'duplicate' && data.newTab && data.candidate) {
     const candidate = tabIndex.get(data.candidate.tabId);
@@ -1066,8 +1367,20 @@ async function handleMessage(message: ZenTabMessage): Promise<unknown> {
   switch (message.type) {
     case 'GET_SNAPSHOT':
       return buildSnapshot();
+    case 'GET_BOOKMARK_TREE':
+      return getBookmarkTreeData();
+    case 'FILE_BOOKMARKS':
+      return fileBookmarks(message.bookmarkIds, message.folderId);
+    case 'APPLY_BOOKMARK_DEDUP':
+      return applyBookmarkDedup(message.groups);
+    case 'SUGGEST_BOOKMARK_FILE':
+      return (await bookmarkSuggestion(message.bookmarkId))?.suggestion ?? null;
     case 'RUN_GROUP_ANALYSIS':
-      return prepareGroupInputs(message.windowId, Boolean(message.deepScanAll));
+      return prepareGroupInputs(message.windowId, Boolean(message.deepScanAll), message.tabIds);
+    case 'GROUP_TABS':
+      return groupSelectedTabs(message.windowId, message.tabIds, message.title, message.color);
+    case 'CREATE_BOOKMARKS':
+      return createBookmarksFromTabs(message.folderId, message.tabs);
     case 'APPLY_GROUP_PROPOSAL':
       return applyGroupProposal(message.proposal);
     case 'RUN_CLEANUP_ANALYSIS':
@@ -1172,7 +1485,12 @@ async function handleMessage(message: ZenTabMessage): Promise<unknown> {
 }
 
 function isMutationMessage(message: ZenTabMessage): boolean {
-  return message.type === 'APPLY_GROUP_PROPOSAL'
+  return message.type === 'FILE_BOOKMARKS'
+    || message.type === 'APPLY_BOOKMARK_DEDUP'
+    || message.type === 'SUGGEST_BOOKMARK_FILE'
+    || message.type === 'GROUP_TABS'
+    || message.type === 'CREATE_BOOKMARKS'
+    || message.type === 'APPLY_GROUP_PROPOSAL'
     || message.type === 'APPLY_CLEANUP'
     || message.type === 'STASH'
     || message.type === 'STASH_WINDOW'
@@ -1198,7 +1516,7 @@ chrome.runtime.onMessage.addListener((message: ZenTabMessage, _sender, sendRespo
   const task = isMutationMessage(message) ? runMutation(() => handleMessage(message)) : handleMessage(message);
   void task
     .then((response) => {
-      scheduleSnapshotBroadcast();
+      if (isMutationMessage(message)) scheduleSnapshotBroadcast();
       sendResponse({ ok: true, data: response });
     })
     .catch((error: unknown) => sendResponse({ ok: false, error: error instanceof Error ? error.message : 'Something went wrong.' }));
@@ -1207,12 +1525,15 @@ chrome.runtime.onMessage.addListener((message: ZenTabMessage, _sender, sendRespo
 
 chrome.tabs.onCreated.addListener((tab) => {
   indexTab(asTabRecord(tab));
+  if (tab.id != null && (tab.url || tab.pendingUrl)) scheduleDuplicateCheck(tab.id);
   scheduleSnapshotBroadcast();
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  indexTab(asTabRecord(tab));
-  if (changeInfo.url || changeInfo.status === 'complete') scheduleDuplicateCheck(tabId);
+  const previousUrl = tabIndex.get(tabId)?.url;
+  const next = asTabRecord(tab);
+  indexTab(next);
+  if (changeInfo.url || next.url !== previousUrl) scheduleDuplicateCheck(tabId);
   scheduleSnapshotBroadcast();
 });
 
@@ -1220,6 +1541,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   const pending = pendingDuplicateChecks.get(tabId);
   if (pending) clearTimeout(pending);
   pendingDuplicateChecks.delete(tabId);
+  lastUrlChangeAt.delete(tabId);
   removeFromCanonicalIndex(tabIndex.get(tabId));
   tabIndex.delete(tabId);
   creationTimes.delete(tabId);
@@ -1292,6 +1614,32 @@ chrome.tabGroups.onUpdated.addListener((group) => {
 chrome.tabGroups.onRemoved.addListener((group) => {
   groupIndex.delete(group.id);
   scheduleSnapshotBroadcast();
+});
+
+let bookmarkListenersBound = false;
+
+function bindBookmarkListeners() {
+  if (bookmarkListenersBound || !canUseBookmarksApi(chrome.bookmarks)) return;
+  bookmarkListenersBound = true;
+  chrome.bookmarks.onCreated.addListener((id, node) => {
+    scheduleBookmarksUpdated();
+    if (!node.url || shouldIgnoreBookmarkCreated(suppressBookmarkCreatedFiling)) return;
+    void runMutation(() => handleCreatedBookmark(id)).catch(() => undefined);
+  });
+  chrome.bookmarks.onChanged.addListener(() => {
+    scheduleBookmarksUpdated();
+  });
+  chrome.bookmarks.onMoved.addListener(() => {
+    scheduleBookmarksUpdated();
+  });
+  chrome.bookmarks.onRemoved.addListener(() => {
+    scheduleBookmarksUpdated();
+  });
+}
+
+bindBookmarkListeners();
+chrome.permissions?.onAdded?.addListener((granted) => {
+  if (granted.permissions?.includes('bookmarks')) bindBookmarkListeners();
 });
 
 chrome.runtime.onStartup.addListener(() => {

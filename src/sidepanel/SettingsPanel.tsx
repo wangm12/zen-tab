@@ -14,6 +14,15 @@ const builtInCopy: Record<BuiltInAiStatus, 'builtInAiUnsupported' | 'builtInAiUn
   available: 'builtInAiAvailable',
 };
 
+type SettingsSegment = 'appearance' | 'tabs' | 'ai' | 'privacy';
+
+const SETTINGS_SEGMENTS: { id: SettingsSegment; label: 'settingsAppearance' | 'settingsTabs' | 'settingsAi' | 'settingsPrivacy' }[] = [
+  { id: 'appearance', label: 'settingsAppearance' },
+  { id: 'tabs', label: 'settingsTabs' },
+  { id: 'ai', label: 'settingsAi' },
+  { id: 'privacy', label: 'settingsPrivacy' },
+];
+
 export function SettingsPanel({ settings, hasCloudApiKey, t, onClose, onUpdate, onUpdateProvider, onUpdateCloudKey, onRequestDeepScanAll, onRequestDiscardInspect, onClearProjectMemory }: {
   settings: ZenTabSettings;
   hasCloudApiKey: boolean;
@@ -26,6 +35,7 @@ export function SettingsPanel({ settings, hasCloudApiKey, t, onClose, onUpdate, 
   onRequestDiscardInspect: (enabled: boolean) => Promise<void>;
   onClearProjectMemory: () => Promise<void>;
 }) {
+  const [segment, setSegment] = useState<SettingsSegment>('appearance');
   const [apiKey, setApiKey] = useState('');
   const [protectedDomains, setProtectedDomains] = useState(settings.protectedDomains.join(', '));
   const [ignoredDomains, setIgnoredDomains] = useState(settings.ignoredDomains.join(', '));
@@ -75,40 +85,50 @@ export function SettingsPanel({ settings, hasCloudApiKey, t, onClose, onUpdate, 
     void getBuiltInAiStatus().then(setBuiltInStatus);
   };
   const showDownloadProgress = downloading || builtInStatus === 'downloading' || downloadPercent != null;
-  return <ModalFrame eyebrow={t('controlRoom')} title={t('settings')} description={t('settingsDescription')} closeLabel={t('close')} onClose={onClose} footer={<button className="primary-button" onClick={onClose}>{t('done')} <Check size={15} /></button>}>
-    <div className="settings-section"><div className="settings-heading"><div><label htmlFor="language-select"><strong>{t('language')}</strong></label><span>{t('languageDescription')}</span></div><select id="language-select" className="inline-select" value={settings.language} onChange={(event) => safelyUpdate({ language: event.target.value as ZenTabSettings['language'] })}><option value="en">English</option><option value="zh">中文</option></select></div></div>
-    <div className="settings-section"><div className="settings-heading"><div><label htmlFor="theme-select"><strong>{t('theme')}</strong></label><span>{t('themeDescription')}</span></div><select id="theme-select" className="inline-select" value={settings.theme} onChange={(event) => safelyUpdate({ theme: event.target.value as ZenTabSettings['theme'] })}><option value="system">{t('systemTheme')}</option><option value="light">{t('lightTheme')}</option><option value="dark">{t('darkTheme')}</option></select></div></div>
-    <div className="settings-section"><div className="settings-heading"><div><strong>{t('duplicateGuard')}</strong><span>{t('catchRepeated')}</span></div><Toggle label={t('duplicateGuard')} checked={settings.duplicateEnabled} onChange={(checked) => safelyUpdate({ duplicateEnabled: checked })} /></div><label className="select-field"><span>{t('matchScope')}</span><select value={settings.duplicateScope} onChange={(event) => safelyUpdate({ duplicateScope: event.target.value as ZenTabSettings['duplicateScope'] })}><option value="all-normal-windows">{t('allNormalWindows')}</option><option value="same-window">{t('currentWindowOnly')}</option></select></label>
-      <label className="field-label" htmlFor="ignored-domains">{t('ignoredDomains')}<input id="ignored-domains" value={ignoredDomains} onChange={(event) => setIgnoredDomains(event.target.value)} onBlur={() => safelyUpdate({ ignoredDomains: ignoredDomains.split(',').map((domain) => domain.trim().toLowerCase()).filter(Boolean) })} placeholder={t('ignoredDomainsPlaceholder')} /></label>
-      <p className="settings-hint">{t('ignoredDomainsDescription')}</p>
+  return <ModalFrame eyebrow={t('controlRoom')} title={t('settings')} description={t('settingsDescription')} closeLabel={t('close')} onClose={onClose} footer={<button className="primary-button" onClick={onClose}>{t('done')} <Check size={15} /></button>} headerExtra={<div className="settings-tabs" role="tablist" aria-label={t('settings')}>
+    {SETTINGS_SEGMENTS.map((item) => <button key={item.id} type="button" role="tab" id={`settings-tab-${item.id}`} className="settings-tab" aria-selected={segment === item.id} aria-controls={`settings-panel-${item.id}`} onClick={() => setSegment(item.id)}>{t(item.label)}</button>)}
+  </div>}>
+    <div id="settings-panel-appearance" role="tabpanel" aria-labelledby="settings-tab-appearance" hidden={segment !== 'appearance'}>
+      <div className="settings-section"><div className="settings-heading"><div><label htmlFor="language-select"><strong>{t('language')}</strong></label><span>{t('languageDescription')}</span></div><select id="language-select" className="inline-select" value={settings.language} onChange={(event) => safelyUpdate({ language: event.target.value as ZenTabSettings['language'] })}><option value="en">English</option><option value="zh">中文</option></select></div></div>
+      <div className="settings-section"><div className="settings-heading"><div><label htmlFor="theme-select"><strong>{t('theme')}</strong></label><span>{t('themeDescription')}</span></div><select id="theme-select" className="inline-select" value={settings.theme} onChange={(event) => safelyUpdate({ theme: event.target.value as ZenTabSettings['theme'] })}><option value="system">{t('systemTheme')}</option><option value="light">{t('lightTheme')}</option><option value="dark">{t('darkTheme')}</option></select></div></div>
     </div>
-    <div className="settings-section"><div className="settings-heading"><div><strong>{t('incognitoWindows')}</strong><span>{t('incognitoWindowsDescription')}</span></div><Toggle label={t('incognitoWindows')} checked={settings.incognitoEnabled} onChange={(checked) => safelyUpdate({ incognitoEnabled: checked })} /></div></div>
-    <div className="settings-section"><div className="settings-heading"><div><strong>{t('deepScanAll')}</strong><span>{t('deepScanDescription')}</span></div><Toggle label={t('deepScanAll')} checked={settings.deepAnalysisEnabled} onChange={safelyRequestDeepScan} /></div><div className="privacy-note"><LockKeyhole size={14} /><span>{t('deepScanPrivacy')}</span></div></div>
-    <div className="settings-section"><div className="settings-heading"><div><strong>{t('autoDiscard')}</strong><span>{t('autoDiscardDescription')}</span></div><Toggle label={t('autoDiscard')} checked={settings.autoDiscardEnabled} onChange={(checked) => safelyUpdate({ autoDiscardEnabled: checked })} /></div>
-      {settings.autoDiscardEnabled && <>
-        <label className="select-field"><span>{t('autoDiscardAfter')}</span><select value={settings.autoDiscardMinutes} onChange={(event) => safelyUpdate({ autoDiscardMinutes: Number(event.target.value) as AutoDiscardMinutes })}>{AUTO_DISCARD_MINUTES.map((minutes) => <option key={minutes} value={minutes}>{t(minutes === 15 ? 'minutes15' : minutes === 30 ? 'minutes30' : minutes === 60 ? 'minutes60' : 'minutes120')}</option>)}</select></label>
-        <div className="settings-heading inspect-toggle"><div><strong>{t('autoDiscardInspect')}</strong><span>{t('autoDiscardInspectDescription')}</span></div><Toggle label={t('autoDiscardInspect')} checked={settings.autoDiscardInspectPages} onChange={(checked) => { void onRequestDiscardInspect(checked).catch(() => undefined); }} /></div>
-      </>}
+    <div id="settings-panel-tabs" role="tabpanel" aria-labelledby="settings-tab-tabs" hidden={segment !== 'tabs'}>
+      <div className="settings-section"><div className="settings-heading"><div><strong>{t('duplicateGuard')}</strong><span>{t('catchRepeated')}</span></div><Toggle label={t('duplicateGuard')} checked={settings.duplicateEnabled} onChange={(checked) => safelyUpdate({ duplicateEnabled: checked })} /></div><label className="select-field"><span>{t('matchScope')}</span><select value={settings.duplicateScope} onChange={(event) => safelyUpdate({ duplicateScope: event.target.value as ZenTabSettings['duplicateScope'] })}><option value="all-normal-windows">{t('allNormalWindows')}</option><option value="same-window">{t('currentWindowOnly')}</option></select></label>
+        <label className="field-label" htmlFor="ignored-domains">{t('ignoredDomains')}<input id="ignored-domains" value={ignoredDomains} onChange={(event) => setIgnoredDomains(event.target.value)} onBlur={() => safelyUpdate({ ignoredDomains: ignoredDomains.split(',').map((domain) => domain.trim().toLowerCase()).filter(Boolean) })} placeholder={t('ignoredDomainsPlaceholder')} /></label>
+        <p className="settings-hint">{t('ignoredDomainsDescription')}</p>
+      </div>
+      <div className="settings-section"><div className="settings-heading"><div><strong>{t('incognitoWindows')}</strong><span>{t('incognitoWindowsDescription')}</span></div><Toggle label={t('incognitoWindows')} checked={settings.incognitoEnabled} onChange={(checked) => safelyUpdate({ incognitoEnabled: checked })} /></div></div>
+      <div className="settings-section"><div className="settings-heading"><div><strong>{t('autoDiscard')}</strong><span>{t('autoDiscardDescription')}</span></div><Toggle label={t('autoDiscard')} checked={settings.autoDiscardEnabled} onChange={(checked) => safelyUpdate({ autoDiscardEnabled: checked })} /></div>
+        {settings.autoDiscardEnabled && <>
+          <label className="select-field"><span>{t('autoDiscardAfter')}</span><select value={settings.autoDiscardMinutes} onChange={(event) => safelyUpdate({ autoDiscardMinutes: Number(event.target.value) as AutoDiscardMinutes })}>{AUTO_DISCARD_MINUTES.map((minutes) => <option key={minutes} value={minutes}>{t(minutes === 15 ? 'minutes15' : minutes === 30 ? 'minutes30' : minutes === 60 ? 'minutes60' : 'minutes120')}</option>)}</select></label>
+          <div className="settings-heading inspect-toggle"><div><strong>{t('autoDiscardInspect')}</strong><span>{t('autoDiscardInspectDescription')}</span></div><Toggle label={t('autoDiscardInspect')} checked={settings.autoDiscardInspectPages} onChange={(checked) => { void onRequestDiscardInspect(checked).catch(() => undefined); }} /></div>
+        </>}
+      </div>
     </div>
-    <div className="settings-section"><div className="settings-heading"><div><strong>{t('aiProvider')}</strong><span>{t('localAutomatic')}</span></div><select className="inline-select" value={settings.aiProvider} onChange={(event) => safelyUpdateProvider(event.target.value as ZenTabSettings['aiProvider'])}><option value="local">{t('localAutomatic')}</option><option value="openai-compatible">{t('openaiCompatible')}</option></select></div>
-      <div className="privacy-note"><LockKeyhole size={14} /><span>{t('builtInAi')}: {t(builtInCopy[builtInStatus])}</span></div>
-      {showDownloadProgress && <div className="model-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={downloadPercent ?? 0} aria-label={t('builtInAiDownloadProgress', { percent: downloadPercent ?? 0 })}>
-        <div className="model-progress-bar"><span style={{ width: `${downloadPercent ?? 0}%` }} /></div>
-        <small>{t('builtInAiDownloadProgress', { percent: downloadPercent ?? 0 })}</small>
-        {downloading && <button type="button" className="text-button" onClick={cancelDownload}>{t('cancel')}</button>}
-      </div>}
-      {builtInStatus === 'downloadable' && !downloading && <button type="button" className="text-button" onClick={() => void downloadModel()}>{t('builtInAiDownload')}</button>}
-      {settings.aiProvider === 'openai-compatible' && <>
-        <label className="field-label" htmlFor="openai-base-url">{t('openaiBaseUrl')}<input id="openai-base-url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} onBlur={() => { if (baseUrl.trim()) void onUpdateProvider('openai-compatible', baseUrl.trim()); }} /></label>
-        <p className="settings-hint">{t('openaiHint')}</p>
-        <label className="field-label" htmlFor="openai-model">{t('openaiModel')}<input id="openai-model" value={model} onChange={(event) => setModel(event.target.value)} onBlur={() => { if (model.trim()) safelyUpdate({ openaiModel: model.trim() }); }} /></label>
-        <label className="field-label" htmlFor="openai-api-key">{t('openaiApiKey')}<input id="openai-api-key" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} onBlur={() => { if (apiKey.trim()) void onUpdateCloudKey(apiKey.trim()); }} placeholder={hasCloudApiKey ? t('savedLocally') : 'sk-…'} /></label>
-        {hasCloudApiKey && <button className="text-button key-clear" type="button" onClick={() => { setApiKey(''); void onUpdateCloudKey(''); }}>{t('clearApiKey')}</button>}
-        <div className="privacy-note"><LockKeyhole size={14} /><span>{t('openaiPrivacy')}</span></div>
-      </>}
+    <div id="settings-panel-ai" role="tabpanel" aria-labelledby="settings-tab-ai" hidden={segment !== 'ai'}>
+      <div className="settings-section"><div className="settings-heading"><div><strong>{t('deepScanAll')}</strong><span>{t('deepScanDescription')}</span></div><Toggle label={t('deepScanAll')} checked={settings.deepAnalysisEnabled} onChange={safelyRequestDeepScan} /></div><div className="privacy-note"><LockKeyhole size={14} /><span>{t('deepScanPrivacy')}</span></div></div>
+      <div className="settings-section"><div className="settings-heading"><div><strong>{t('aiProvider')}</strong><span>{t('localAutomatic')}</span></div><select className="inline-select" value={settings.aiProvider} onChange={(event) => safelyUpdateProvider(event.target.value as ZenTabSettings['aiProvider'])}><option value="local">{t('localAutomatic')}</option><option value="openai-compatible">{t('openaiCompatible')}</option></select></div>
+        <div className="privacy-note"><LockKeyhole size={14} /><span>{t('builtInAi')}: {t(builtInCopy[builtInStatus])}</span></div>
+        {showDownloadProgress && <div className="model-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={downloadPercent ?? 0} aria-label={t('builtInAiDownloadProgress', { percent: downloadPercent ?? 0 })}>
+          <div className="model-progress-bar"><span style={{ width: `${downloadPercent ?? 0}%` }} /></div>
+          <small>{t('builtInAiDownloadProgress', { percent: downloadPercent ?? 0 })}</small>
+          {downloading && <button type="button" className="text-button" onClick={cancelDownload}>{t('cancel')}</button>}
+        </div>}
+        {builtInStatus === 'downloadable' && !downloading && <button type="button" className="text-button" onClick={() => void downloadModel()}>{t('builtInAiDownload')}</button>}
+        {settings.aiProvider === 'openai-compatible' && <>
+          <label className="field-label" htmlFor="openai-base-url">{t('openaiBaseUrl')}<input id="openai-base-url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} onBlur={() => { if (baseUrl.trim()) void onUpdateProvider('openai-compatible', baseUrl.trim()); }} /></label>
+          <p className="settings-hint">{t('openaiHint')}</p>
+          <label className="field-label" htmlFor="openai-model">{t('openaiModel')}<input id="openai-model" value={model} onChange={(event) => setModel(event.target.value)} onBlur={() => { if (model.trim()) safelyUpdate({ openaiModel: model.trim() }); }} /></label>
+          <label className="field-label" htmlFor="openai-api-key">{t('openaiApiKey')}<input id="openai-api-key" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} onBlur={() => { if (apiKey.trim()) void onUpdateCloudKey(apiKey.trim()); }} placeholder={hasCloudApiKey ? t('savedLocally') : 'sk-…'} /></label>
+          {hasCloudApiKey && <button className="text-button key-clear" type="button" onClick={() => { setApiKey(''); void onUpdateCloudKey(''); }}>{t('clearApiKey')}</button>}
+          <div className="privacy-note"><LockKeyhole size={14} /><span>{t('openaiPrivacy')}</span></div>
+        </>}
+      </div>
+      <div className="settings-section memory-settings"><div className="settings-heading"><div><strong>{t('clearProjectMemory')}</strong><span>{t('clearProjectMemoryDescription')}</span></div><button className="text-button danger-outline" type="button" onClick={() => void onClearProjectMemory()}>{t('clearProjectMemory')}</button></div></div>
     </div>
-    <div className="settings-section"><div className="settings-heading"><div><label htmlFor="protected-domains"><strong>{t('protectedDomains')}</strong></label><span>{t('protectedDomainsDescription')}</span></div><Tag size={16} className="section-icon" /></div><input id="protected-domains" className="full-input" value={protectedDomains} onChange={(event) => setProtectedDomains(event.target.value)} onBlur={() => safelyUpdate({ protectedDomains: protectedDomains.split(',').map((domain) => domain.trim().toLowerCase()).filter(Boolean) })} placeholder={t('protectedDomainsPlaceholder')} /></div>
-    <div className="settings-section memory-settings"><div className="settings-heading"><div><strong>{t('clearProjectMemory')}</strong><span>{t('clearProjectMemoryDescription')}</span></div><button className="text-button danger-outline" type="button" onClick={() => void onClearProjectMemory()}>{t('clearProjectMemory')}</button></div></div>
-    <div className="settings-footnote"><Info size={14} /> {t('settingsFootnote')}</div>
+    <div id="settings-panel-privacy" role="tabpanel" aria-labelledby="settings-tab-privacy" hidden={segment !== 'privacy'}>
+      <div className="settings-section"><div className="settings-heading"><div><label htmlFor="protected-domains"><strong>{t('protectedDomains')}</strong></label><span>{t('protectedDomainsDescription')}</span></div><Tag size={16} className="section-icon" /></div><input id="protected-domains" className="full-input" value={protectedDomains} onChange={(event) => setProtectedDomains(event.target.value)} onBlur={() => safelyUpdate({ protectedDomains: protectedDomains.split(',').map((domain) => domain.trim().toLowerCase()).filter(Boolean) })} placeholder={t('protectedDomainsPlaceholder')} /></div>
+      <div className="settings-footnote"><Info size={14} /> {t('settingsFootnote')}</div>
+    </div>
   </ModalFrame>;
 }

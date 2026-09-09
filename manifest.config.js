@@ -6,7 +6,7 @@ export default defineManifest({
     version: '0.1.0',
     minimum_chrome_version: '116',
     permissions: ['tabs', 'tabGroups', 'sidePanel', 'storage', 'alarms', 'sessions'],
-    optional_permissions: ['scripting'],
+    optional_permissions: ['scripting', 'bookmarks', 'favicon'],
     optional_host_permissions: ['<all_urls>', 'https://api.groq.com/*', 'https://api.openai.com/*', 'http://127.0.0.1/*', 'http://localhost/*'],
     background: {
         service_worker: 'src/background/service-worker.ts',

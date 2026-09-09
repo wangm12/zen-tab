@@ -46,13 +46,13 @@ export function useFocusTrap(containerRef: React.RefObject<HTMLElement | null>, 
   }, [active, containerRef, initialFocusRef]);
 }
 
-export function ModalFrame({ eyebrow, title, description, closeLabel, onClose, children, footer }: { eyebrow: string; title: string; description: string; closeLabel?: string; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode }) {
+export function ModalFrame({ eyebrow, title, description, closeLabel, onClose, children, footer, headerExtra }: { eyebrow: string; title: string; description: string; closeLabel?: string; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode; headerExtra?: React.ReactNode }) {
   const dialogRef = useRef<HTMLElement>(null);
   const titleId = `${useId()}-title`;
   const descriptionId = `${useId()}-description`;
   useFocusTrap(dialogRef, onClose);
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) onClose(); }}><section ref={dialogRef} className="modal-sheet" role="dialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={descriptionId}>
-    <header className="modal-header"><div><span className="eyebrow">{eyebrow}</span><h2 id={titleId}>{title}</h2><p id={descriptionId}>{description}</p></div><button className="icon-button" onClick={onClose} aria-label={closeLabel ?? 'Close'}><X size={18} /></button></header>
+    <header className="modal-header"><div><span className="eyebrow">{eyebrow}</span><h2 id={titleId}>{title}</h2><p id={descriptionId}>{description}</p></div><button className="icon-button" onClick={onClose} aria-label={closeLabel ?? 'Close'}><X size={18} /></button>{headerExtra}</header>
     <div className="modal-content">{children}</div>
     {footer && <footer className="modal-footer">{footer}</footer>}
   </section></div>;
