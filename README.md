@@ -4,87 +4,115 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
-Zen Tab is a Manifest V3 Chrome extension for people who work with many tabs. It keeps the browser organized without taking over: duplicate tabs are handled quickly, project groups are suggested with evidence, and sessions can be stashed and restored when you need them again.
+Zen Tab is a Manifest V3 Chrome extension designed for people who work with many browser tabs. It transforms Chrome's native side panel into a focused, organized command center—helping you manage multi-window tabs, detect and close duplicates, file bookmarks, and stash heavy project sessions to free up memory, all without changing your browsing habits.
+
+---
 
 ## Preview
 
-![Zen Tab side-panel workspace](docs/screenshots/zen-tab-workspace.png)
+<p align="center">
+  <img src="docs/screenshots/zen-tab-workspace.png" alt="Zen Tab side-panel workspace" width="380" />
+</p>
 
-## Highlights
+---
 
-- **Live tab workspace** — Browse windows, native tab groups, and ungrouped tabs from a narrow side panel: search and settings on top, Tabs / Stash / Bookmarks below.
-- **Duplicate guard** — Detect repeated pages as soon as a URL is ready. Actions are fast, reversible, and isolated between normal and private windows.
-- **Bookmark inbox** — Optional bookmark access to file Inbox items into existing folders, review duplicates before deleting, and fuzzy-search title, URL, folder, or an optional page summary.
-- **Project-aware grouping** — Suggests groups from titles, URL paths, search terms, and optional page context instead of grouping by domain alone.
-- **Safe cleanup** — Recommends low-value tabs for review; nothing is closed until you confirm it.
-- **Stash and restore** — Save a window, group, or selection locally, close the saved tabs, and restore them later in a new window.
-- **Large-session friendly** — Uses event-driven state updates, incremental rendering, bounded AI batches, and no background polling.
-- **Keyboard-friendly selection** — Supports multi-selection patterns such as Command/Ctrl-click, Shift-click, and Command/Ctrl+A.
+## ✨ Highlights & Features
 
-## Privacy and safety
+### ⚡ Live Tab Workspace
+- **Multi-Window Navigation**: Switch between Window 1, Window 2, and Window 3 with clear tab counters without flipping desktop windows.
+- **Native Group Support**: Integrates directly with Chrome's native tab groups. Drag, collapse, and color-code groups right from the side panel.
+- **Instant Search (`⌘K` / `Ctrl+K`)**: Fuzzy-search across active tabs, stashed sessions, and bookmarks in real time.
 
-- Tab management works without an AI provider.
-- Project analysis starts with tab metadata; page summaries are opt-in and requested only when additional context is needed.
-- Local analysis is preferred when available. Groq is optional BYOK: your API key is stored locally and is used only after you choose Groq in Settings.
-- AI grouping and cleanup always show a review state. Low-confidence tabs remain unclassified instead of being forced into a group.
-- Cleanup uses conservative guardrails for active, pinned, local, audio-playing, and protected pages. If safety cannot be verified, the page is left alone.
-- Stashes are stored in `chrome.storage.local`. Zen Tab does not collect full browsing history or enable telemetry by default.
+### 🛡️ Duplicate Tab Guard
+- **Early Detection**: Identifies repeated URLs immediately as tabs open.
+- **Reversible Actions**: One-click cleanup of duplicate pages with complete undo support.
+- **Window Isolation**: Strict separation between normal and incognito browsing sessions.
 
-## Install as an unpacked extension
+### 📦 Stash & Restore Sessions
+- **Free Up Memory**: Save an entire window, tab group, or multi-selected tabs to local storage and close them.
+- **Resume Anytime**: Restore your stashed project in a fresh window whenever you're ready to pick it up again.
+- **Zero Background Polling**: Uses event-driven state updates to maintain performance during large sessions.
 
-### Requirements
+### 📥 Bookmark Inbox & Smart Filing
+- **Visual Folder Navigation**: Fast color-coded pills for your bookmark folders (`Work`, `Research`, `Reading`, etc.).
+- **Filing Inbox**: Quickly file unorganized tabs into bookmark folders on the fly.
+- **Bookmark Health Check**: Review duplicates, broken links, and unfiled items before deleting.
 
-- Chrome 116 or newer
-- Node.js and npm for building from source
+### 🎨 Atmosphere & Focus
+- **Subtle Background Canvas**: Adaptive dynamic visual texture that responds softly to your workspace.
+- **Dark & Light Mode**: Seamless adaptation with high-contrast accessibility.
+- **Keyboard-First Selection**: Multi-select tabs effortlessly with `Command/Ctrl-click`, `Shift-click`, and `Command/Ctrl+A`.
 
-### Build
+---
+
+## 🔒 Privacy & Safety
+
+Zen Tab is built on an uncompromising local-first philosophy:
+
+- **100% Local-First by Default**: Tab management, duplicate detection, and session stashing require **no internet connection** and **no external servers**.
+- **Zero Telemetry**: No tracking, no user profiling, and no analytics scripts.
+- **Safe Guardrails**: Active audio-playing tabs, pinned tabs, and protected system pages are never closed automatically.
+- **Optional BYOK AI**: Advanced semantic grouping is purely optional and runs using your own API key (Bring Your Own Key) directly against Groq. Keys are stored strictly on device in `chrome.storage.local`.
+
+---
+
+## ⌨️ Keyboard Shortcuts
+
+| Shortcut (Mac) | Shortcut (Windows/Linux) | Action |
+| :--- | :--- | :--- |
+| `⌘ + Shift + Space` | `Ctrl + Shift + Space` | Open / Close Zen Tab Side Panel |
+| `⌘ + K` | `Ctrl + K` | Focus Global Fuzzy Search |
+| `⌘ + Click` | `Ctrl + Click` | Toggle multi-select individual tabs |
+| `Shift + Click` | `Shift + Click` | Range select tabs |
+| `⌘ + A` | `Ctrl + A` | Select all tabs in current group/window |
+
+---
+
+## 📦 Installation
+
+### From Chrome Web Store
+> *Currently under review by the Chrome Web Store team. Direct store link will be updated here upon public availability.*
+
+### Install from Source (Developer Mode)
+
+1. **Clone the repository**:
+   ```bash
+   git clone https://github.com/wangm12/zen-tab.git
+   cd zen-tab
+   ```
+2. **Install dependencies and build**:
+   ```bash
+   npm install
+   npm run build
+   ```
+3. **Load unpacked in Chrome**:
+   - Open `chrome://extensions` in Chrome.
+   - Enable **Developer mode** in the top-right corner.
+   - Click **Load unpacked** and select the `dist/` directory inside `zen-tab`.
+   - Click the Zen Tab toolbar icon or press `⌘ + Shift + Space` to open the side panel!
+
+---
+
+## 🛠️ Development & Quality Gate
 
 ```bash
-npm install
-npm run build
-```
-
-### Load in Chrome
-
-1. Open `chrome://extensions`.
-2. Enable **Developer mode**.
-3. Click **Load unpacked**.
-4. Select this project's generated `dist/` directory.
-5. Pin Zen Tab if you want quick access, then click its toolbar icon to open the side panel.
-
-After source changes, run `npm run build` again and click **Reload** on the extension card.
-
-## Development
-
-Start the Vite development workflow:
-
-```bash
+# Start local Vite development server
 npm run dev
-```
 
-Run the complete quality gate before submitting changes:
-
-```bash
+# Run comprehensive quality checks (TypeScript + 350 Vitest tests + Build)
 npm run check
+
+# Package extension zip for Chrome Web Store
+npm run package
 ```
 
-The quality gate includes:
+---
 
-- TypeScript type checking
-- Unit tests
-- Production extension build
+## 🏗️ Architecture & Tech Stack
 
-## Architecture
-
-Zen Tab is built with:
-
-- Manifest V3
-- React + Vite + TypeScript
-- Chrome `sidePanel`, `tabs`, `tabGroups`, `storage`, and optional `bookmarks` APIs
-- A service worker as the source of truth for tab state and browser mutations
-- Virtualized side-panel rendering for large tab collections
-- A provider interface for local and optional cloud AI analysis
-
-## Project status
-
-Zen Tab is currently an active development project. The side-panel workspace, early duplicate handling, stash/restore, bookmark inbox, AI grouping preview, conservative cleanup, settings, localization, undo, and event-driven updates are implemented. Chrome Desktop is the supported target for now.
+- **Platform**: Chrome Extensions Manifest V3
+- **Frontend**: React 18, TypeScript 5.7, Tailwind CSS 3.4
+- **Build System**: Vite 6, `@crxjs/vite-plugin`
+- **Testing**: Vitest 2.1 (350+ unit tests)
+- **State Management**: Zustand 5 + Service Worker Message Bus
+- **Performance**: `@tanstack/react-virtual` for virtualized rendering of large tab collections
