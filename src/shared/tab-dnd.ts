@@ -154,13 +154,24 @@ export function resolveTabDragEnd(input: {
 
   if (over.kind === 'list-end') {
     const index = resolveTabMoveIndex(dragged.index, { type: 'end' }, moveOptions);
-    return index == null ? NONE : { type: 'move', tabId: dragged.tabId, windowId, index };
+    const lastTab = tabs[tabs.length - 1];
+    const isUngroupedEnd = dragged.groupId !== -1 && Boolean(lastTab && lastTab.groupId === -1);
+    if (index == null) {
+      return isUngroupedEnd ? { type: 'ungroup', tabId: dragged.tabId } : NONE;
+    }
+    return isUngroupedEnd
+      ? { type: 'ungroup-and-move', tabId: dragged.tabId, windowId, index }
+      : { type: 'move', tabId: dragged.tabId, windowId, index };
   }
 
   if (over.kind === 'tab') {
     const target = tabs.find((tab) => tab.tabId === over.tabId);
     if (!target || !placement) return NONE;
     const index = resolveTabMoveIndex(dragged.index, { type: placement, targetIndex: target.index }, moveOptions);
+    if (dragged.groupId !== -1 && target.groupId === -1) {
+      if (index == null) return { type: 'ungroup', tabId: dragged.tabId };
+      return { type: 'ungroup-and-move', tabId: dragged.tabId, windowId, index };
+    }
     return index == null ? NONE : { type: 'move', tabId: dragged.tabId, windowId, index };
   }
 

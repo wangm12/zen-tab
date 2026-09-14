@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import {
-  Archive, Bookmark, Check, ChevronDown, ChevronRight, Globe2, Layers3, ListFilter, LockKeyhole, MicOff, MoreHorizontal, Palette, Pencil, Pin, Sparkles, Trash2, Ungroup, Volume2,
+  Archive, Bookmark, Check, ChevronDown, ChevronRight, Globe2, Layers3, ListFilter, LockKeyhole, MicOff, MoreHorizontal, Palette, Pencil, Pin, Sparkles, Trash2, Ungroup, Volume2, X,
 } from 'lucide-react';
 import { pickFaviconStack, groupSurfaceColor, firstViewportIndex, resolveStickyGroup, stickyHeaderHasScrolledAway } from '../shared/atmosphere';
 import { displayHostname } from '../shared/url';
@@ -21,6 +21,10 @@ import { FaviconStack } from './FaviconStack';
 import { Translator } from './i18n';
 import { setTabDragOverId } from './tab-drag-over';
 import { usePointerDragSession } from './use-pointer-drag-session';
+
+export type TabTreeDragSource =
+  | { kind: 'tab'; tabId: number }
+  | { kind: 'group'; groupId: number };
 
 export type TabDragCommitEvent = {
   canceled: boolean;
@@ -112,16 +116,43 @@ export function TabTree({ windowSnapshot, search, t, onTabDragEnd, onToggleGroup
     lastHit: { surface: DragSurface; placement?: 'before' | 'after' } | null;
   }>({ overId: null, lastHit: null });
 
-  const { overlay, source: draggedTabId, onPointerDown: onHandlePointerDown, consumeSuppressedClick } = usePointerDragSession<number>({
+  const { overlay, source: draggedSource, onPointerDown: onHandlePointerDown, consumeSuppressedClick } = usePointerDragSession<TabTreeDragSource>({
     enabled: sortableEnabled,
     scrollerRef: scrollRef,
-    onActivate: (tabId) => {
+    onActivate: (source) => {
       dragHitRef.current = { overId: null, lastHit: null };
-      setVisualRows(placeVisualPlaceholder(rowsRef.current, tabId, { type: 'origin' }));
+      if (source.kind === 'tab') {
+        setVisualRows(placeVisualPlaceholder(rowsRef.current, source.tabId, { type: 'origin' }));
+      }
     },
-    onDrag: (tabId, point) => {
+    onDrag: (source, point) => {
       const scroller = scrollRef.current;
       const rawHit = hitTestTabDragTarget(point.x, point.y, (x, y) => document.elementFromPoint(x, y));
+      if (source.kind === 'group') {
+        let overId: string | null = null;
+        if (rawHit) {
+          if (rawHit.surface.kind === 'ungrouped' || rawHit.surface.kind === 'sticky-ungrouped') {
+            overId = formatTabDragId(rawHit.surface);
+          } else if (rawHit.surface.kind === 'tab') {
+            const targetTab = snapshotRef.current?.tabs.find((tab) => tab.tabId === (rawHit.surface as { tabId: number }).tabId);
+            if (targetTab && targetTab.groupId === -1) {
+              const ungrouped = rowsRef.current.find((r): r is Extract<TreeRow, { kind: 'group' }> => r.kind === 'group' && Boolean(r.synthetic));
+              overId = ungrouped ? formatTabDragId({ kind: 'ungrouped', windowId: snapshotRef.current?.windowId ?? 0 }) : formatTabDragId(rawHit.surface);
+            }
+          } else if (rawHit.surface.kind === 'list-end') {
+            const lastTab = snapshotRef.current?.tabs[snapshotRef.current.tabs.length - 1];
+            if (lastTab && lastTab.groupId === -1) {
+              overId = formatTabDragId(rawHit.surface);
+            }
+          } else if (rawHit.surface.kind === 'stash') {
+            overId = 'nav-stash';
+          }
+        }
+        dragHitRef.current.overId = overId;
+        setTabDragOverId(overId);
+        return;
+      }
+      const tabId = source.tabId;
       const scrollerRect = scroller?.getBoundingClientRect();
       const lastTabBottom = scroller
         ? [...scroller.querySelectorAll('[data-tab-drop^="tab-"]')].reduce((bottom, node) => Math.max(bottom, node.getBoundingClientRect().bottom), 0) || null
@@ -170,10 +201,26 @@ export function TabTree({ windowSnapshot, search, t, onTabDragEnd, onToggleGroup
       }) == null) return;
       setVisualRows(placeVisualPlaceholder(rowsRef.current, tabId, { type: placement, tabId: overTabId }));
     },
-    onFinish: (tabId, canceled) => {
+    onFinish: (source, canceled) => {
       const overId = dragHitRef.current.overId;
       dragHitRef.current = { overId: null, lastHit: null };
       setTabDragOverId(null);
+      if (source.kind === 'group') {
+        const sourceId = formatTabDragId({ kind: 'group', groupId: source.groupId });
+        if (canceled || !overId) {
+          onTabDragEnd({ canceled, operation: { source: { id: sourceId }, target: null } });
+          return;
+        }
+        onTabDragEnd({
+          canceled: false,
+          operation: {
+            source: { id: sourceId },
+            target: { id: overId },
+          },
+        });
+        return;
+      }
+      const tabId = source.tabId;
       const sourceId = formatTabDragId({ kind: 'tab', tabId });
       if (canceled || !overId) {
         setVisualRows(null);
@@ -195,7 +242,7 @@ export function TabTree({ windowSnapshot, search, t, onTabDragEnd, onToggleGroup
   });
 
   const draggingRef = useRef(false);
-  draggingRef.current = draggedTabId != null;
+  draggingRef.current = draggedSource != null;
   useEffect(() => {
     if (draggingRef.current) return;
     setVisualRows(null);
@@ -323,7 +370,10 @@ export function TabTree({ windowSnapshot, search, t, onTabDragEnd, onToggleGroup
 
   const selectedIds = [...selectedTabIds];
   const selectionMode = selectedIds.length > 0;
+  const draggedTabId = draggedSource?.kind === 'tab' ? draggedSource.tabId : null;
+  const draggedGroupId = draggedSource?.kind === 'group' ? draggedSource.groupId : null;
   const draggedTab = draggedTabId == null ? undefined : windowSnapshot.tabs.find((tab) => tab.tabId === draggedTabId);
+  const draggedGroup = draggedGroupId == null ? undefined : windowSnapshot.groups.find((group) => group.groupId === draggedGroupId);
   const closeSelected = async () => {
     if (await onCloseTabs(selectedIds)) clearSelection();
   };
@@ -348,22 +398,38 @@ export function TabTree({ windowSnapshot, search, t, onTabDragEnd, onToggleGroup
       : sticky
         ? { kind: 'sticky-group' as const, groupId: row.id }
         : { kind: 'group' as const, groupId: row.id };
-    return <GroupRow row={row} droppable={droppable} t={t} overflowCloseToken={overflowCloseToken} onOpenOverflow={onOpenOverflow} onOpenContextMenu={openContextMenu} onToggle={() => {
-      if (row.synthetic) setSyntheticCollapsed((previous) => {
-        const next = new Set(previous);
-        if (next.has(row.id)) next.delete(row.id); else next.add(row.id);
-        return next;
-      });
-      else onToggleGroup(row.id, !row.collapsed);
-    }} onStash={row.synthetic ? onStashUngrouped : () => onStashGroup(row.id)} onSelectAll={() => {
-      setSelectedTabIds(new Set(groupTabIds));
-      setSelectionAnchorId(groupTabIds[0] ?? null);
-    }} onCloseAll={() => { void onCloseTabs(groupTabIds); }} onGroupThese={() => { void onGroupTabs(groupTabIds); }} onAction={onAction} />;
+    return <GroupRow
+      row={row}
+      droppable={droppable}
+      t={t}
+      dragEnabled={sortableEnabled && !sticky}
+      dragging={draggedGroupId === row.id}
+      overflowCloseToken={overflowCloseToken}
+      onOpenOverflow={onOpenOverflow}
+      onOpenContextMenu={openContextMenu}
+      onToggle={() => {
+        if (row.synthetic) setSyntheticCollapsed((previous) => {
+          const next = new Set(previous);
+          if (next.has(row.id)) next.delete(row.id); else next.add(row.id);
+          return next;
+        });
+        else onToggleGroup(row.id, !row.collapsed);
+      }}
+      onStash={row.synthetic ? onStashUngrouped : () => onStashGroup(row.id)}
+      onSelectAll={() => {
+        setSelectedTabIds(new Set(groupTabIds));
+        setSelectionAnchorId(groupTabIds[0] ?? null);
+      }}
+      onCloseAll={() => { void onCloseTabs(groupTabIds); }}
+      onGroupThese={() => { void onGroupTabs(groupTabIds); }}
+      onAction={onAction}
+      onHandlePointerDown={onHandlePointerDown}
+      consumeSuppressedClick={consumeSuppressedClick}
+    />;
   };
 
   return <>
-    {selectionMode && <div className="selection-bar" role="toolbar" aria-label={t('selected')}><span className="selection-summary"><strong>{selectedIds.length}</strong> {t('selected')} <span className="selection-mode-label">{t('selectionMode')}</span></span><div className="selection-actions"><button className="selection-action" onClick={() => void onGroupTabs(selectedIds).then((ok) => { if (ok) clearSelection(); })}><Layers3 size={14} /> {t('groupSelected')}</button><button className="selection-action" onClick={() => void onAnalyzeTabs(selectedIds).then((ok) => { if (ok) clearSelection(); })}><Sparkles size={14} /> {t('analyzeSelection')}</button><button className="selection-action" onClick={() => void onFileTabs(selectedIds).then((ok) => { if (ok) clearSelection(); })}><Bookmark size={14} /> {t('fileToBookmarks')}</button><button className="selection-action" onClick={() => void onStashTabs(selectedIds).then((ok) => { if (ok) clearSelection(); })}><Archive size={14} /> {t('stash')}</button><button className="selection-action" onClick={() => void closeSelected()}><Trash2 size={14} /> {t('close')}</button><button className="selection-clear" onClick={clearSelection} aria-label={t('exitSelection')}>{t('done')}</button></div></div>}
-    <div className={draggedTabId != null ? 'tree-scroller is-dragging' : 'tree-scroller'} ref={scrollRef} tabIndex={0} aria-label={t('liveTabs')} onKeyDown={handleTreeKeyDown} onContextMenu={openCanvasMenu}>
+    <div className={draggedSource != null ? 'tree-scroller is-dragging' : 'tree-scroller'} ref={scrollRef} tabIndex={0} aria-label={t('liveTabs')} onKeyDown={handleTreeKeyDown} onContextMenu={openCanvasMenu}>
       {stickyGroup && <div className="sticky-group-header" key={stickyGroup.id}>{renderGroupRow(stickyGroup, true)}</div>}
       <div className={draggedTabId != null ? 'tree-canvas is-sorting' : 'tree-canvas'} style={{ height: virtualizer.getTotalSize() }}>{virtualItems.map((virtualRow) => {
         const row = displayRows[virtualRow.index];
@@ -373,8 +439,92 @@ export function TabTree({ windowSnapshot, search, t, onTabDragEnd, onToggleGroup
           {row.kind === 'group' ? renderGroupRow(row) : row.kind === 'placeholder' ? <div className="tab-drop-placeholder" aria-hidden="true" /> : <TabRow tab={row.tab} dragging={draggedTabId === row.tab.tabId} dragEnabled={sortableEnabled} groupColor={row.groupColor} t={t} selected={selectedTabIds.has(row.tab.tabId)} selectionMode={selectionMode} overflowCloseToken={overflowCloseToken} onOpenOverflow={onOpenOverflow} onRowContextMenu={(event) => openTabContextMenu(event, row.tab)} onSelect={(event, forceToggle) => selectTab(row.tab.tabId, event, forceToggle)} onClearSelection={clearSelection} onStash={() => { void onStashTabs([row.tab.tabId]); }} onAction={onAction} onHandlePointerDown={onHandlePointerDown} consumeSuppressedClick={consumeSuppressedClick} />}
         </div>;
       })}</div>
-      {draggedTabId != null && <div className="tree-list-end" data-tab-drop={formatTabDragId({ kind: 'list-end', windowId: windowSnapshot.windowId })} aria-hidden="true" />}
+      {draggedSource != null && <div className="tree-list-end" data-tab-drop={formatTabDragId({ kind: 'list-end', windowId: windowSnapshot.windowId })} aria-hidden="true" />}
     </div>
+    {selectionMode && (
+      <div className="selection-bar" role="toolbar" aria-label={t('selected')}>
+        <div className="selection-left">
+          <div className="selection-badge">
+            <span className="selection-pill">{selectedIds.length}</span>
+            <span className="selection-label">{t('selected')}</span>
+          </div>
+          <button
+            type="button"
+            className="selection-link-btn"
+            onClick={() => {
+              if (selectedIds.length === visibleTabIds.length && visibleTabIds.length > 0) {
+                clearSelection();
+              } else {
+                setSelectedTabIds(new Set(visibleTabIds));
+                setSelectionAnchorId(visibleTabIds[0] ?? null);
+              }
+            }}
+          >
+            {selectedIds.length === visibleTabIds.length && visibleTabIds.length > 0
+              ? t('exitSelection')
+              : t('selectAll')}
+          </button>
+        </div>
+        <div className="selection-actions">
+          <button
+            type="button"
+            className="selection-btn-primary"
+            onClick={() => void onGroupTabs(selectedIds).then((ok) => { if (ok) clearSelection(); })}
+            title={t('groupSelected')}
+            aria-label={t('groupSelected')}
+          >
+            <Layers3 size={13} />
+            <span>{t('groupSelected')}</span>
+          </button>
+          <button
+            type="button"
+            className="selection-icon-btn"
+            onClick={() => void onAnalyzeTabs(selectedIds).then((ok) => { if (ok) clearSelection(); })}
+            title={t('analyzeSelection')}
+            aria-label={t('analyzeSelection')}
+          >
+            <Sparkles size={14} />
+          </button>
+          <button
+            type="button"
+            className="selection-icon-btn"
+            onClick={() => void onFileTabs(selectedIds).then((ok) => { if (ok) clearSelection(); })}
+            title={t('fileToBookmarks')}
+            aria-label={t('fileToBookmarks')}
+          >
+            <Bookmark size={14} />
+          </button>
+          <button
+            type="button"
+            className="selection-icon-btn"
+            onClick={() => void onStashTabs(selectedIds).then((ok) => { if (ok) clearSelection(); })}
+            title={t('stash')}
+            aria-label={t('stash')}
+          >
+            <Archive size={14} />
+          </button>
+          <button
+            type="button"
+            className="selection-icon-btn danger"
+            onClick={() => void closeSelected()}
+            title={t('close')}
+            aria-label={t('close')}
+          >
+            <Trash2 size={14} />
+          </button>
+          <span className="selection-divider" aria-hidden="true" />
+          <button
+            type="button"
+            className="selection-dismiss"
+            onClick={clearSelection}
+            title={t('exitSelection')}
+            aria-label={t('exitSelection')}
+          >
+            <X size={15} />
+          </button>
+        </div>
+      </div>
+    )}
     {contextMenuNode}
     {overlay && draggedTab && <DragPreviewOverlay
       x={overlay.x}
@@ -382,10 +532,33 @@ export function TabTree({ windowSnapshot, search, t, onTabDragEnd, onToggleGroup
       icon={draggedTab.favIconUrl ? <img src={draggedTab.favIconUrl} alt="" /> : <Globe2 size={14} />}
       title={draggedTab.title || t('untitledTab')}
     />}
+    {overlay && draggedGroup && <DragPreviewOverlay
+      x={overlay.x}
+      y={overlay.y}
+      icon={<Layers3 size={14} />}
+      title={draggedGroup.title || t('untitledGroup')}
+    />}
   </>;
 }
 
-function GroupRow({ row, droppable, t, overflowCloseToken, onOpenOverflow, onOpenContextMenu, onToggle, onStash, onSelectAll, onCloseAll, onGroupThese, onAction }: { row: Extract<TreeRow, { kind: 'group' }>; droppable: { kind: 'group'; groupId: number } | { kind: 'ungrouped'; windowId: number } | { kind: 'sticky-group'; groupId: number } | { kind: 'sticky-ungrouped'; windowId: number }; t: Translator; overflowCloseToken: number; onOpenOverflow: () => void; onOpenContextMenu: (event: React.MouseEvent, items: ContextMenuItem[], label: string) => void; onToggle: () => void; onStash: () => void; onSelectAll: () => void; onCloseAll: () => void; onGroupThese: () => void; onAction: (message: ZenTabMessage) => void }) {
+function GroupRow({ row, droppable, t, dragEnabled, dragging, overflowCloseToken, onOpenOverflow, onOpenContextMenu, onToggle, onStash, onSelectAll, onCloseAll, onGroupThese, onAction, onHandlePointerDown, consumeSuppressedClick }: {
+  row: Extract<TreeRow, { kind: 'group' }>;
+  droppable: { kind: 'group'; groupId: number } | { kind: 'ungrouped'; windowId: number } | { kind: 'sticky-group'; groupId: number } | { kind: 'sticky-ungrouped'; windowId: number };
+  t: Translator;
+  dragEnabled: boolean;
+  dragging: boolean;
+  overflowCloseToken: number;
+  onOpenOverflow: () => void;
+  onOpenContextMenu: (event: React.MouseEvent, items: ContextMenuItem[], label: string) => void;
+  onToggle: () => void;
+  onStash: () => void;
+  onSelectAll: () => void;
+  onCloseAll: () => void;
+  onGroupThese: () => void;
+  onAction: (message: ZenTabMessage) => void;
+  onHandlePointerDown: (source: TabTreeDragSource, event: React.PointerEvent<HTMLElement>) => void;
+  consumeSuppressedClick: () => boolean;
+}) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [name, setName] = useState(row.name === t('untitledGroup') ? '' : row.name);
@@ -441,11 +614,26 @@ function GroupRow({ row, droppable, t, overflowCloseToken, onOpenOverflow, onOpe
   const surface = groupSurfaceColor(row.synthetic ? 'none' : row.color as GroupColor);
   return <DroppableSurface
     surface={droppable}
-    className={row.synthetic ? 'group-row-shell' : 'group-row-shell has-rail'}
+    className={[
+      row.synthetic ? 'group-row-shell' : 'group-row-shell has-rail',
+      dragging ? 'is-dragging-source' : '',
+    ].filter(Boolean).join(' ')}
     style={{ '--group-wash': surface.wash, '--group-dot': surface.dot } as React.CSSProperties}
     onContextMenu={openGroupContextMenu}
   >
-    <button className="group-row" onClick={onToggle} aria-expanded={!row.collapsed}>
+    <button
+      className={['group-row', dragging ? 'dragging' : '', !row.synthetic && dragEnabled ? 'draggable' : ''].filter(Boolean).join(' ')}
+      onClick={() => {
+        if (consumeSuppressedClick()) return;
+        onToggle();
+      }}
+      onPointerDown={(event) => {
+        if (!row.synthetic && dragEnabled) {
+          onHandlePointerDown({ kind: 'group', groupId: row.id }, event);
+        }
+      }}
+      aria-expanded={!row.collapsed}
+    >
       <span className="group-chevron">{row.collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}</span>
       {row.synthetic && <span className="group-dot neutral" />}
       <span className="group-name">{row.name}</span>
@@ -465,7 +653,7 @@ function GroupRow({ row, droppable, t, overflowCloseToken, onOpenOverflow, onOpe
   </DroppableSurface>;
 }
 
-const TabRow = memo(function TabRow({ tab, dragging, dragEnabled, groupColor, t, selected, selectionMode, overflowCloseToken, onOpenOverflow, onRowContextMenu, onSelect, onClearSelection, onStash, onAction, onHandlePointerDown, consumeSuppressedClick }: { tab: TabRecord; dragging: boolean; dragEnabled: boolean; groupColor: GroupColor | 'none'; t: Translator; selected: boolean; selectionMode: boolean; overflowCloseToken: number; onOpenOverflow: () => void; onRowContextMenu: (event: React.MouseEvent<HTMLDivElement>) => void; onSelect: (event: React.MouseEvent, forceToggle?: boolean) => void; onClearSelection: () => void; onStash: () => void; onAction: (message: ZenTabMessage) => void; onHandlePointerDown: (tabId: number, event: React.PointerEvent<HTMLElement>) => void; consumeSuppressedClick: () => boolean }) {
+const TabRow = memo(function TabRow({ tab, dragging, dragEnabled, groupColor, t, selected, selectionMode, overflowCloseToken, onOpenOverflow, onRowContextMenu, onSelect, onClearSelection, onStash, onAction, onHandlePointerDown, consumeSuppressedClick }: { tab: TabRecord; dragging: boolean; dragEnabled: boolean; groupColor: GroupColor | 'none'; t: Translator; selected: boolean; selectionMode: boolean; overflowCloseToken: number; onOpenOverflow: () => void; onRowContextMenu: (event: React.MouseEvent<HTMLDivElement>) => void; onSelect: (event: React.MouseEvent, forceToggle?: boolean) => void; onClearSelection: () => void; onStash: () => void; onAction: (message: ZenTabMessage) => void; onHandlePointerDown: (source: TabTreeDragSource, event: React.PointerEvent<HTMLElement>) => void; consumeSuppressedClick: () => boolean }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuPlacement, setMenuPlacement] = useState<'up' | 'down'>('down');
   const favicon = tab.favIconUrl;
@@ -504,7 +692,7 @@ const TabRow = memo(function TabRow({ tab, dragging, dragEnabled, groupColor, t,
       role="button"
       tabIndex={0}
       title={selectionMode ? t('clickToSelect') : (tab.url || tab.title)}
-      onPointerDown={(event) => { if (dragEnabled) onHandlePointerDown(tab.tabId, event); }}
+      onPointerDown={(event) => { if (dragEnabled) onHandlePointerDown({ kind: 'tab', tabId: tab.tabId }, event); }}
       onClick={(event) => { if (consumeSuppressedClick()) { event.preventDefault(); event.stopPropagation(); return; } if (selectionMode) { event.preventDefault(); event.stopPropagation(); onSelect(event, true); return; } if (event.metaKey || event.ctrlKey || event.shiftKey) { event.preventDefault(); onSelect(event); return; } setMenuOpen(false); onClearSelection(); onAction({ type: 'UPDATE_TAB', tabId: tab.tabId, windowId: tab.windowId, action: 'activate' }); }}
       onKeyDown={(event) => {
         if (event.key !== 'Enter' && event.key !== ' ') return;

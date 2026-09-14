@@ -205,14 +205,41 @@ describe('resolveTabDragEnd', () => {
     })).toEqual({ type: 'none' });
   });
 
-  it('moves to the Chrome strip end on list-end', () => {
+  it('ungroups and moves when dropped onto an ungrouped tab', () => {
+    const options = { pinnedCount: 1, tabCount: 5, pinned: false };
+    expect(resolveTabDragEnd({
+      dragged: { tabId: 2, index: 1, pinned: false, groupId: 7 },
+      over: { kind: 'tab', tabId: 4 },
+      placement: 'before',
+      windowId: 9,
+      tabs,
+    })).toEqual({
+      type: 'ungroup-and-move',
+      tabId: 2,
+      windowId: 9,
+      index: resolveTabMoveIndex(1, { type: 'before', targetIndex: 3 }, options),
+    });
+  });
+
+  it('moves to the Chrome strip end on list-end (ungrouping if strip ends ungrouped)', () => {
     expect(resolveTabDragEnd({
       dragged: { tabId: 2, index: 1, pinned: false, groupId: 7 },
       over: { kind: 'list-end', windowId: 9 },
       windowId: 9,
       tabs,
-    })).toEqual({ type: 'move', tabId: 2, windowId: 9, index: -1 });
+    })).toEqual({ type: 'ungroup-and-move', tabId: 2, windowId: 9, index: -1 });
     expect(resolveTabDragEnd({ ...base, over: { kind: 'list-end', windowId: 9 } })).toEqual({ type: 'none' });
+
+    const allGroupedTabs = [
+      { tabId: 1, index: 0, groupId: 7, pinned: false },
+      { tabId: 2, index: 1, groupId: 7, pinned: false },
+    ];
+    expect(resolveTabDragEnd({
+      dragged: { tabId: 1, index: 0, pinned: false, groupId: 7 },
+      over: { kind: 'list-end', windowId: 9 },
+      windowId: 9,
+      tabs: allGroupedTabs,
+    })).toEqual({ type: 'move', tabId: 1, windowId: 9, index: -1 });
   });
 
   it('splices a tab row before or after another tab', () => {

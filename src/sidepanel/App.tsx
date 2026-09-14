@@ -223,6 +223,33 @@ function App() {
     const liveWindow = currentWindowRef.current;
     if (!liveSnapshot || !liveWindow) return;
     const source = parseTabDragId(String(event.operation.source?.id ?? ''));
+    if (source?.kind === 'group') {
+      const over = parseTabDragId(String(event.operation.target?.id ?? ''));
+      if (!over) return;
+      if (over.kind === 'ungrouped' || over.kind === 'sticky-ungrouped') {
+        void action({ type: 'UNGROUP_GROUP', groupId: source.groupId });
+        return;
+      }
+      if (over.kind === 'tab') {
+        const targetTab = liveWindow.tabs.find((tab) => tab.tabId === over.tabId);
+        if (targetTab && targetTab.groupId === -1) {
+          void action({ type: 'UNGROUP_GROUP', groupId: source.groupId });
+          return;
+        }
+      }
+      if (over.kind === 'list-end') {
+        const lastTab = liveWindow.tabs[liveWindow.tabs.length - 1];
+        if (lastTab && lastTab.groupId === -1) {
+          void action({ type: 'UNGROUP_GROUP', groupId: source.groupId });
+          return;
+        }
+      }
+      if (over.kind === 'stash') {
+        void stashSelection({ scope: 'group', groupId: source.groupId, includePinned: false, includeActive: true, busyLabel: t('stashingGroup') });
+        return;
+      }
+      return;
+    }
     if (source?.kind !== 'tab') return;
     const dragged = liveWindow.tabs.find((tab) => tab.tabId === source.tabId);
     if (!dragged) return;
