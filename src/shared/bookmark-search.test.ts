@@ -11,6 +11,8 @@ const bookmarks: BookmarkRecord[] = [
     folderPath: 'Reading',
     isInbox: false,
     isBookmarksBar: false,
+    folderKind: 'folder',
+    index: 0,
   },
   {
     id: 'url',
@@ -20,6 +22,8 @@ const bookmarks: BookmarkRecord[] = [
     folderPath: 'Reading',
     isInbox: false,
     isBookmarksBar: false,
+    folderKind: 'folder',
+    index: 0,
   },
   {
     id: 'folder',
@@ -29,6 +33,8 @@ const bookmarks: BookmarkRecord[] = [
     folderPath: 'Work / Zen Tab',
     isInbox: false,
     isBookmarksBar: false,
+    folderKind: 'folder',
+    index: 0,
   },
   {
     id: 'summary',
@@ -39,6 +45,8 @@ const bookmarks: BookmarkRecord[] = [
     summary: 'Accessible keyboard navigation patterns',
     isInbox: false,
     isBookmarksBar: false,
+    folderKind: 'folder',
+    index: 0,
   },
 ];
 

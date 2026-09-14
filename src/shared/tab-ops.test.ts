@@ -3,6 +3,9 @@ import { DEFAULT_SETTINGS } from './types';
 import {
   isCleanupProtectedTab,
   isExplicitlyCloseableTab,
+  dropPositionFromPoint,
+  resolveTabMoveIndex,
+  resolveUngroupedInsertIndex,
   restoreDescriptorKey,
   restoreInsertIndex,
   sortGroupsByStripOrder,
@@ -49,6 +52,53 @@ describe('explicit close vs cleanup close', () => {
     expect(isCleanupProtectedTab({ ...tab, url: 'https://www.figma.com/file/abc' }, options)).toBe(true);
     expect(isCleanupProtectedTab({ ...tab, url: 'http://localhost:3000' }, options)).toBe(true);
     expect(isCleanupProtectedTab(tab, options)).toBe(false);
+  });
+});
+
+describe('tab move index', () => {
+  const five = { pinnedCount: 0, tabCount: 5, pinned: false };
+
+  it('moves the last tab to the first unpinned slot', () => {
+    expect(resolveTabMoveIndex(4, { type: 'start' }, five)).toBe(0);
+    expect(resolveTabMoveIndex(4, { type: 'start' }, { pinnedCount: 2, tabCount: 5, pinned: false })).toBe(2);
+    expect(resolveTabMoveIndex(2, { type: 'start' }, { pinnedCount: 2, tabCount: 5, pinned: false })).toBeNull();
+  });
+
+  it('uses Chrome -1 so a tab can reach the end of the strip', () => {
+    expect(resolveTabMoveIndex(0, { type: 'end' }, five)).toBe(-1);
+    expect(resolveTabMoveIndex(3, { type: 'after', targetIndex: 4 }, five)).toBe(-1);
+    expect(resolveTabMoveIndex(4, { type: 'end' }, five)).toBeNull();
+    expect(resolveTabMoveIndex(4, { type: 'after', targetIndex: 4 }, five)).toBeNull();
+  });
+
+  it('keeps before/after inserts next to the target tab', () => {
+    expect(resolveTabMoveIndex(4, { type: 'before', targetIndex: 0 }, five)).toBe(0);
+    expect(resolveTabMoveIndex(0, { type: 'before', targetIndex: 4 }, five)).toBe(3);
+    expect(resolveTabMoveIndex(4, { type: 'after', targetIndex: 0 }, five)).toBe(1);
+    expect(resolveTabMoveIndex(1, { type: 'after', targetIndex: 2 }, five)).toBe(2);
+  });
+
+  it('will not park an unpinned tab among pinned tabs', () => {
+    const pinnedHead = { pinnedCount: 2, tabCount: 6, pinned: false };
+    expect(resolveTabMoveIndex(5, { type: 'before', targetIndex: 0 }, pinnedHead)).toBe(2);
+  });
+
+  it('reads before/after from the pointer, not a stale row half', () => {
+    expect(dropPositionFromPoint(10, 0, 48)).toBe('before');
+    expect(dropPositionFromPoint(40, 0, 48)).toBe('after');
+  });
+
+  it('places a drop on Ungrouped at the first ungrouped strip index', () => {
+    expect(resolveUngroupedInsertIndex([
+      { index: 0, groupId: 8 },
+      { index: 1, groupId: 8 },
+      { index: 2, groupId: -1 },
+      { index: 3, groupId: -1 },
+    ])).toBe(2);
+    expect(resolveUngroupedInsertIndex([
+      { index: 0, groupId: 8 },
+      { index: 1, groupId: 8 },
+    ])).toBe(-1);
   });
 });
 

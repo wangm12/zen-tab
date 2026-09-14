@@ -1,18 +1,29 @@
 import { describe, expect, test } from 'vitest';
 import {
+  assertMutableBookmarkNode,
+  bookmarkMoveIndex,
+  canFileIntoBookmarkParent,
+  canMutateBookmarkNode,
   canRestoreBookmarkIntoParent,
   existingCanonicalUrlsInBookmarkParent,
+  filingDestinationFolders,
   findBookmarkDuplicateGroups,
   flattenBookmarkTree,
+  folderCreateParentFolders,
+  isBookmarkMoveCycle,
+  isManagedBookmarkNode,
+  otherBookmarksRootId,
   planBookmarkCreates,
   shouldRestoreFiledBookmark,
+  shouldRestoreMovedBookmark,
   suggestBookmarkFolder,
   validateBookmarkDedupGroups,
 } from './bookmarks';
 import { ProjectMemoryRule } from './types';
 
 type Node = chrome.bookmarks.BookmarkTreeNode & {
-  folderType?: 'bookmarks-bar' | 'other' | 'mobile';
+  folderType?: 'bookmarks-bar' | 'other' | 'mobile' | 'managed';
+  unmodifiable?: 'managed';
   children?: Node[];
 };
 
@@ -109,10 +120,83 @@ describe('flattenBookmarkTree', () => {
       folderPath: 'Other',
       isInbox: true,
       isBookmarksBar: false,
+      folderKind: 'other' as const,
+      index: 0,
     };
 
     expect(unknownRoot?.isSpecialRoot).toBe(true);
     expect(suggestBookmarkFolder(bookmark, [], flattened.folders, [])).toBeNull();
+  });
+
+  test('attaches folderKind, index, and unmodifiable', () => {
+    const roots: Node[] = [{
+      id: '0',
+      title: '',
+      children: [
+        { id: '1', parentId: '0', title: 'Bookmarks Bar', index: 0, folderType: 'bookmarks-bar', children: [] },
+        {
+          id: '2',
+          parentId: '0',
+          title: 'Other Bookmarks',
+          index: 1,
+          folderType: 'other',
+          children: [
+            { id: 'eng', parentId: '2', title: 'Engineering', index: 2, children: [
+              { id: 'doc', parentId: 'eng', title: 'Doc', url: 'https://doc.example', index: 0 },
+            ] },
+          ],
+        },
+        { id: '3', parentId: '0', title: 'Mobile Bookmarks', index: 2, folderType: 'mobile', children: [
+          { id: 'm1', parentId: '3', title: 'Phone', url: 'https://m.example', index: 0 },
+        ] },
+        {
+          id: '99',
+          parentId: '0',
+          title: 'Managed Bookmarks',
+          index: 3,
+          folderType: 'managed',
+          unmodifiable: 'managed',
+          children: [
+            { id: 'policy', parentId: '99', title: 'Policy', url: 'https://policy.example', index: 0, unmodifiable: 'managed' },
+          ],
+        },
+      ],
+    }];
+
+    const { folders, bookmarks } = flattenBookmarkTree(roots);
+    expect(folders.find((folder) => folder.id === '1')).toMatchObject({ folderKind: 'bar', index: 0, isSpecialRoot: true });
+    expect(folders.find((folder) => folder.id === '2')).toMatchObject({ folderKind: 'other', index: 1, isSpecialRoot: true });
+    expect(folders.find((folder) => folder.id === '3')).toMatchObject({ folderKind: 'mobile', index: 2, isSpecialRoot: true });
+    expect(folders.find((folder) => folder.id === '99')).toMatchObject({
+      folderKind: 'managed',
+      index: 3,
+      isSpecialRoot: true,
+      unmodifiable: 'managed',
+    });
+    expect(folders.find((folder) => folder.id === 'eng')).toMatchObject({ folderKind: 'folder', index: 2 });
+    expect(bookmarks.find((item) => item.id === 'doc')).toMatchObject({ folderKind: 'other', index: 0, isInbox: false });
+    expect(bookmarks.find((item) => item.id === 'm1')).toMatchObject({ folderKind: 'mobile', index: 0, isInbox: false });
+    expect(bookmarks.find((item) => item.id === 'policy')).toMatchObject({
+      folderKind: 'managed',
+      unmodifiable: 'managed',
+    });
+  });
+
+  test('does not treat a nested folder titled Bookmarks Bar as a special root', () => {
+    const roots = tree([]);
+    roots[0].children?.[0].children?.push({
+      id: 'nested-bar',
+      parentId: '1',
+      title: 'Bookmarks Bar',
+      children: [],
+    });
+
+    const nested = flattenBookmarkTree(roots).folders.find((folder) => folder.id === 'nested-bar');
+    expect(nested).toMatchObject({
+      folderKind: 'folder',
+      isSpecialRoot: false,
+      isBookmarksBar: false,
+    });
   });
 });
 
@@ -213,9 +297,9 @@ describe('findBookmarkDuplicateGroups', () => {
 describe('validateBookmarkDedupGroups', () => {
   test('keeps only live removals that still match the live keep URL', () => {
     const live = [
-      { id: 'keep', parentId: 'folder', title: 'Keep', url: 'https://example.com/page?utm_source=x', folderPath: 'Saved', isInbox: false, isBookmarksBar: false },
-      { id: 'same', parentId: 'folder', title: 'Same', url: 'https://example.com/page#section', folderPath: 'Saved', isInbox: false, isBookmarksBar: false },
-      { id: 'changed', parentId: 'folder', title: 'Changed', url: 'https://different.example', folderPath: 'Saved', isInbox: false, isBookmarksBar: false },
+      { id: 'keep', parentId: 'folder', title: 'Keep', url: 'https://example.com/page?utm_source=x', folderPath: 'Saved', isInbox: false, isBookmarksBar: false, folderKind: 'folder' as const, index: 0 },
+      { id: 'same', parentId: 'folder', title: 'Same', url: 'https://example.com/page#section', folderPath: 'Saved', isInbox: false, isBookmarksBar: false, folderKind: 'folder' as const, index: 1 },
+      { id: 'changed', parentId: 'folder', title: 'Changed', url: 'https://different.example', folderPath: 'Saved', isInbox: false, isBookmarksBar: false, folderKind: 'folder' as const, index: 2 },
     ];
 
     expect(validateBookmarkDedupGroups(live, [{
@@ -226,8 +310,8 @@ describe('validateBookmarkDedupGroups', () => {
 
   test('drops a group whose keep bookmark is missing while retaining valid groups', () => {
     const live = [
-      { id: 'keep-2', parentId: 'folder', title: 'Keep 2', url: 'https://two.example', folderPath: 'Saved', isInbox: false, isBookmarksBar: false },
-      { id: 'remove-2', parentId: 'folder', title: 'Remove 2', url: 'https://two.example/', folderPath: 'Saved', isInbox: false, isBookmarksBar: false },
+      { id: 'keep-2', parentId: 'folder', title: 'Keep 2', url: 'https://two.example', folderPath: 'Saved', isInbox: false, isBookmarksBar: false, folderKind: 'folder' as const, index: 0 },
+      { id: 'remove-2', parentId: 'folder', title: 'Remove 2', url: 'https://two.example/', folderPath: 'Saved', isInbox: false, isBookmarksBar: false, folderKind: 'folder' as const, index: 1 },
     ];
 
     expect(validateBookmarkDedupGroups(live, [
@@ -302,6 +386,127 @@ describe('planBookmarkCreates', () => {
   });
 });
 
+describe('otherBookmarksRootId', () => {
+  test('finds Other by folderKind, not id 2', () => {
+    const folders = [
+      { id: 'bar', folderKind: 'bar' as const, title: 'Bar', folderPath: 'Bar', isInbox: false, isSpecialRoot: true, isBookmarksBar: true, index: 0 },
+      { id: 'other-root', folderKind: 'other' as const, title: '其他书签', folderPath: '其他书签', isInbox: false, isSpecialRoot: true, isBookmarksBar: false, index: 1 },
+    ];
+    expect(otherBookmarksRootId(folders)).toBe('other-root');
+    expect(otherBookmarksRootId([])).toBeUndefined();
+  });
+});
+
+describe('assertMutableBookmarkNode', () => {
+  test('assertMutableBookmarkNode', () => {
+    const folders = [
+      { id: 'eng', folderKind: 'folder' as const, title: 'Eng', folderPath: 'Eng', isInbox: false, isSpecialRoot: false, isBookmarksBar: false, index: 0 },
+      { id: '1', folderKind: 'bar' as const, title: 'Bar', folderPath: 'Bar', isInbox: false, isSpecialRoot: true, isBookmarksBar: true, index: 0 },
+    ];
+    expect(() => assertMutableBookmarkNode({ id: 'doc', url: 'https://x.example' }, folders)).not.toThrow();
+    expect(() => assertMutableBookmarkNode({ id: '1' }, folders)).toThrow();
+    expect(() => assertMutableBookmarkNode({ id: 'missing' }, folders)).toThrow();
+    expect(() => assertMutableBookmarkNode({ id: 'doc', url: 'https://x.example', unmodifiable: 'managed' }, folders)).toThrow();
+  });
+
+  test('rejects nodes under a managed ancestor', () => {
+    const folders = [
+      { id: '99', folderKind: 'managed' as const, title: 'Managed', folderPath: 'Managed', isInbox: false, isSpecialRoot: true, isBookmarksBar: false, index: 3, unmodifiable: 'managed' as const },
+      { id: 'policy-folder', parentId: '99', folderKind: 'folder' as const, title: 'Policy', folderPath: 'Managed / Policy', isInbox: false, isSpecialRoot: false, isBookmarksBar: false, index: 0 },
+    ];
+    expect(() => assertMutableBookmarkNode({ id: 'policy-folder' }, folders)).toThrow();
+    expect(() => assertMutableBookmarkNode({
+      id: 'item',
+      url: 'https://x.example',
+      parentId: 'policy-folder',
+    }, folders)).toThrow();
+  });
+});
+
+describe('canMutateBookmarkNode', () => {
+  test('rejects special roots and managed descendants', () => {
+    expect(canMutateBookmarkNode({ folderKind: 'folder' })).toBe(true);
+    expect(canMutateBookmarkNode({ folderKind: 'bar' })).toBe(false);
+    expect(canMutateBookmarkNode({ folderKind: 'other' })).toBe(false);
+    expect(canMutateBookmarkNode({ folderKind: 'mobile' })).toBe(false);
+    expect(canMutateBookmarkNode({ folderKind: 'managed' })).toBe(false);
+    expect(canMutateBookmarkNode({ folderKind: 'folder', unmodifiable: 'managed' })).toBe(false);
+  });
+});
+
+describe('canFileIntoBookmarkParent', () => {
+  const folders = [
+    { id: '1', folderKind: 'bar' as const, title: 'Bar', folderPath: 'Bar', isInbox: false, isSpecialRoot: true, isBookmarksBar: true, index: 0 },
+    { id: '2', folderKind: 'other' as const, title: 'Other', folderPath: 'Other', isInbox: false, isSpecialRoot: true, isBookmarksBar: false, index: 1 },
+    { id: '3', folderKind: 'mobile' as const, title: 'Mobile', folderPath: 'Mobile', isInbox: false, isSpecialRoot: true, isBookmarksBar: false, index: 2 },
+    { id: '99', folderKind: 'managed' as const, title: 'Managed', folderPath: 'Managed', isInbox: false, isSpecialRoot: true, isBookmarksBar: false, index: 3, unmodifiable: 'managed' as const },
+    { id: 'eng', parentId: '2', folderKind: 'folder' as const, title: 'Eng', folderPath: 'Other / Eng', isInbox: false, isSpecialRoot: false, isBookmarksBar: false, index: 0 },
+    { id: 'policy', parentId: '99', folderKind: 'folder' as const, title: 'Policy', folderPath: 'Managed / Policy', isInbox: false, isSpecialRoot: false, isBookmarksBar: false, index: 0 },
+  ];
+
+  test('allows bar, Other, and regular folders; rejects mobile and managed', () => {
+    expect(canFileIntoBookmarkParent('1', folders)).toBe(true);
+    expect(canFileIntoBookmarkParent('2', folders)).toBe(true);
+    expect(canFileIntoBookmarkParent('eng', folders)).toBe(true);
+    expect(canFileIntoBookmarkParent('3', folders)).toBe(false);
+    expect(canFileIntoBookmarkParent('99', folders)).toBe(false);
+    expect(canFileIntoBookmarkParent('policy', folders)).toBe(false);
+    expect(canFileIntoBookmarkParent('missing', folders)).toBe(false);
+  });
+});
+
+describe('filingDestinationFolders', () => {
+  test('keeps bar out of organize dests and also drops managed descendants', () => {
+    const folders = [
+      { id: '1', folderKind: 'bar' as const, title: 'Bar', folderPath: 'Bar', isInbox: false, isSpecialRoot: true, isBookmarksBar: true, index: 0 },
+      { id: '2', folderKind: 'other' as const, title: 'Other', folderPath: 'Other', isInbox: false, isSpecialRoot: true, isBookmarksBar: false, index: 1 },
+      { id: 'eng', parentId: '2', folderKind: 'folder' as const, title: 'Eng', folderPath: 'Other / Eng', isInbox: false, isSpecialRoot: false, isBookmarksBar: false, index: 0 },
+      { id: 'inbox', parentId: '2', folderKind: 'folder' as const, title: 'Inbox', folderPath: 'Other / Inbox', isInbox: true, isSpecialRoot: false, isBookmarksBar: false, index: 1 },
+      { id: '99', folderKind: 'managed' as const, title: 'Managed', folderPath: 'Managed', isInbox: false, isSpecialRoot: true, isBookmarksBar: false, index: 3, unmodifiable: 'managed' as const },
+      { id: 'policy', parentId: '99', folderKind: 'folder' as const, title: 'Policy', folderPath: 'Managed / Policy', isInbox: false, isSpecialRoot: false, isBookmarksBar: false, index: 0 },
+    ];
+    expect(filingDestinationFolders(folders).map((folder) => folder.id)).toEqual(['eng']);
+    expect(folderCreateParentFolders(folders).map((folder) => folder.id)).toEqual(['1', '2', 'eng']);
+  });
+});
+
+describe('isManagedBookmarkNode', () => {
+  test('walks ancestors for managed root or unmodifiable', () => {
+    const folders = [
+      { id: '99', folderKind: 'managed' as const, title: 'Managed', folderPath: 'Managed', isInbox: false, isSpecialRoot: true, isBookmarksBar: false, index: 3, unmodifiable: 'managed' as const },
+      { id: 'policy-folder', parentId: '99', folderKind: 'folder' as const, title: 'Policy', folderPath: 'Managed / Policy', isInbox: false, isSpecialRoot: false, isBookmarksBar: false, index: 0 },
+      { id: 'locked', parentId: '2', folderKind: 'folder' as const, title: 'Locked', folderPath: 'Other / Locked', isInbox: false, isSpecialRoot: false, isBookmarksBar: false, index: 0, unmodifiable: 'managed' as const },
+      { id: 'eng', parentId: '2', folderKind: 'folder' as const, title: 'Eng', folderPath: 'Other / Eng', isInbox: false, isSpecialRoot: false, isBookmarksBar: false, index: 0 },
+    ];
+    expect(isManagedBookmarkNode('99', folders)).toBe(true);
+    expect(isManagedBookmarkNode('policy-folder', folders)).toBe(true);
+    expect(isManagedBookmarkNode('locked', folders)).toBe(true);
+    expect(isManagedBookmarkNode('eng', folders)).toBe(false);
+  });
+});
+
+describe('bookmarkMoveIndex', () => {
+  test('returns target index for before and targetIndex + 1 for after (matching Chrome BookmarkModel::Move)', () => {
+    expect(bookmarkMoveIndex({ fromIndex: 1, targetIndex: 3, placement: 'after', sameParent: true })).toBe(4);
+    expect(bookmarkMoveIndex({ fromIndex: 1, targetIndex: 3, placement: 'before', sameParent: true })).toBe(3);
+    expect(bookmarkMoveIndex({ fromIndex: 3, targetIndex: 1, placement: 'before', sameParent: true })).toBe(1);
+    expect(bookmarkMoveIndex({ fromIndex: 1, targetIndex: 2, placement: 'after', sameParent: false })).toBe(3);
+  });
+});
+
+describe('isBookmarkMoveCycle', () => {
+  test('rejects drop into self or descendant', () => {
+    const folders = [
+      { id: 'p', parentId: '2', title: 'P', folderPath: 'P', isInbox: false, isSpecialRoot: false, isBookmarksBar: false, folderKind: 'folder' as const, index: 0 },
+      { id: 'c', parentId: 'p', title: 'C', folderPath: 'P / C', isInbox: false, isSpecialRoot: false, isBookmarksBar: false, folderKind: 'folder' as const, index: 0 },
+    ];
+    expect(isBookmarkMoveCycle('p', 'p', folders)).toBe(true);
+    expect(isBookmarkMoveCycle('p', 'c', folders)).toBe(true);
+    expect(isBookmarkMoveCycle('c', 'p', folders)).toBe(false);
+    expect(isBookmarkMoveCycle('c', '2', folders)).toBe(false);
+  });
+});
+
 describe('bookmark undo safety', () => {
   const move = {
     id: 'bookmark',
@@ -315,6 +520,17 @@ describe('bookmark undo safety', () => {
     expect(shouldRestoreFiledBookmark(move, { id: 'bookmark', parentId: 'inbox', title: 'Saved', url: 'https://example.com' })).toBe(false);
     expect(shouldRestoreFiledBookmark(move, { id: 'bookmark', parentId: 'user-folder', title: 'Saved', url: 'https://example.com' })).toBe(false);
     expect(shouldRestoreFiledBookmark(move, undefined)).toBe(false);
+  });
+
+  test('shouldRestoreMovedBookmark restores same-parent index changes', () => {
+    const move = { id: 'b', fromParentId: 'p', fromIndex: 2, toParentId: 'p', toIndex: 0 };
+    expect(shouldRestoreMovedBookmark(move, { parentId: 'p', index: 0 })).toBe(true);
+    expect(shouldRestoreMovedBookmark(move, { parentId: 'p', index: 2 })).toBe(false);
+    expect(shouldRestoreMovedBookmark(move, undefined)).toBe(false);
+    expect(shouldRestoreFiledBookmark(
+      { id: 'b', fromParentId: 'p', fromIndex: 2, toParentId: 'p' },
+      { id: 'b', parentId: 'p' } as chrome.bookmarks.BookmarkTreeNode,
+    )).toBe(false);
   });
 
   test('restores a removed bookmark only into a live folder', () => {

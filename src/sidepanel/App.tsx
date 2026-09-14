@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Archive, Bookmark, Layers3, ListFilter, MoreHorizontal, PanelLeft, Search, Settings2, Sparkles, X,
+  Archive, Bookmark, Download, Inbox, Layers3, ListFilter, MoreHorizontal, PanelLeft, Search, Settings2, Sparkles, X,
 } from 'lucide-react';
 import { applyProjectMemory, createAIProvider } from '../shared/ai';
-import { BOOKMARK_WORKSPACE_PERMISSIONS } from '../shared/bookmark-favicon';
+import { BOOKMARK_WORKSPACE_PERMISSIONS, readFaviconGranted } from '../shared/bookmark-favicon';
 import { hostPermissionForBaseUrl, normalizeOpenAiBaseUrl } from '../shared/openai';
 import { downloadTextFile, exportWindowAsJson } from '../shared/portable';
 import { BookmarkRecord, CleanupProposal, GroupProposal, StashRecord, TabRecord, ToastMessage, ZenTabSettings } from '../shared/types';
+import { AtmosphereCanvas } from './AtmosphereCanvas';
 import { AudioBar } from './AudioBar';
-import { BookmarkList } from './BookmarkList';
+import { BookmarkChrome, BookmarkList } from './BookmarkList';
 import { CleanupModal } from './CleanupModal';
 import { CommandPalette } from './CommandPalette';
 import { GroupModal } from './GroupModal';
@@ -21,7 +22,9 @@ import { showsUnifiedSearch, useZenTabStore } from './store';
 import { TabTree } from './TabTree';
 import { Toast } from './ui';
 import { UnifiedSearch } from './UnifiedSearch';
-import { bookmarkNavTabDragOver, fileDroppedTab } from './file-dropped-tab';
+import { DroppableSurface } from './dnd-surfaces';
+import { fileDroppedTab } from './file-dropped-tab';
+import { parseTabDragId, readTabPlacement, resolveTabDragEnd } from '../shared/tab-dnd';
 
 type StashSelection = { scope: 'window' | 'group' | 'tabs'; groupId?: number; tabIds?: number[]; includePinned: boolean; includeActive: boolean; busyLabel: string };
 
@@ -33,10 +36,12 @@ function App() {
   const [draftGroupProposal, setDraftGroupProposal] = useState<GroupProposal | null>(null);
   const [draftCleanupProposal, setDraftCleanupProposal] = useState<CleanupProposal | null>(null);
   const [organizeMenuOpen, setOrganizeMenuOpen] = useState(false);
-  const [stashDropActive, setStashDropActive] = useState(false);
-  const [bookmarkDropActive, setBookmarkDropActive] = useState(false);
+  const [bookmarkChrome, setBookmarkChrome] = useState<BookmarkChrome | null>(null);
+  const snapshotRef = useRef(snapshot);
+  snapshotRef.current = snapshot;
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteBookmarks, setPaletteBookmarks] = useState<BookmarkRecord[]>([]);
+  const [faviconGranted, setFaviconGranted] = useState(false);
   const [unifiedActiveIndex, setUnifiedActiveIndex] = useState(0);
   const [focusStashId, setFocusStashId] = useState<string | undefined>();
   const searchRef = useRef<HTMLInputElement>(null);
@@ -44,9 +49,26 @@ function App() {
   const language = snapshot?.settings.language ?? 'en';
   const t = useMemo(() => createTranslator(language), [language]);
   const unifiedEntries = useMemo(
-    () => snapshot ? buildPaletteEntries(snapshot.windows, search, t, paletteBookmarks, snapshot.stashes) : [],
-    [paletteBookmarks, search, snapshot, t],
+    () => snapshot ? buildPaletteEntries(snapshot.windows, search, t, paletteBookmarks, snapshot.stashes, faviconGranted) : [],
+    [faviconGranted, paletteBookmarks, search, snapshot, t],
   );
+
+  useEffect(() => {
+    let cancelled = false;
+    const checkFavicon = async () => {
+      if (typeof chrome === 'undefined' || !chrome.permissions?.contains) return;
+      const granted = await readFaviconGranted((details) => chrome.permissions.contains(details));
+      if (!cancelled) setFaviconGranted(granted);
+    };
+    void checkFavicon();
+    if (typeof chrome !== 'undefined' && chrome.permissions?.onAdded) {
+      chrome.permissions.onAdded.addListener(checkFavicon);
+      chrome.permissions.onRemoved?.addListener(checkFavicon);
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => setDraftGroupProposal(groupProposal), [groupProposal]);
   useEffect(() => setDraftCleanupProposal(cleanupProposal), [cleanupProposal]);
@@ -89,8 +111,11 @@ function App() {
       document.removeEventListener('pointerdown', closeOnOutsidePointer);
     };
   }, [organizeMenuOpen]);
+  useEffect(() => { setOrganizeMenuOpen(false); }, [section]);
 
   const currentWindow = snapshot?.windows.find((window) => window.windowId === selectedWindowId) ?? snapshot?.windows[0];
+  const currentWindowRef = useRef(currentWindow);
+  currentWindowRef.current = currentWindow;
   const proposalTabs = draftGroupProposal ? snapshot?.windows.find((window) => window.windowId === draftGroupProposal.sourceWindowId)?.tabs ?? [] : [];
   const tabCount = snapshot?.windows.reduce((sum, window) => sum + window.tabs.length, 0) ?? 0;
   const audibleTabs = currentWindow?.tabs.filter((tab) => tab.audible) ?? [];
@@ -179,7 +204,6 @@ function App() {
   const stashSelection = useCallback(async (selection: StashSelection) => {
     if (!currentWindow) return false;
     setOrganizeMenuOpen(false);
-    setStashDropActive(false);
     setBusy(selection.busyLabel);
     try {
       const stash = await request<StashRecord>({ type: 'STASH', windowId: currentWindow.windowId, scope: selection.scope, groupId: selection.groupId, tabIds: selection.tabIds, includePinned: selection.includePinned, includeActive: selection.includeActive });
@@ -192,6 +216,53 @@ function App() {
       setBusy(null);
     }
   }, [currentWindow, request, setBusy, showToast, t]);
+
+  const commitTabDrag = useCallback(async (event: { canceled: boolean; operation: { source?: { id: string | number } | null; target?: { id: string | number } | null } }) => {
+    if (event.canceled) return;
+    const liveSnapshot = snapshotRef.current;
+    const liveWindow = currentWindowRef.current;
+    if (!liveSnapshot || !liveWindow) return;
+    const source = parseTabDragId(String(event.operation.source?.id ?? ''));
+    if (source?.kind !== 'tab') return;
+    const dragged = liveWindow.tabs.find((tab) => tab.tabId === source.tabId);
+    if (!dragged) return;
+    const over = parseTabDragId(String(event.operation.target?.id ?? ''));
+    const result = resolveTabDragEnd({
+      dragged,
+      over,
+      placement: over?.kind === 'tab' ? readTabPlacement() : undefined,
+      windowId: liveWindow.windowId,
+      tabs: liveWindow.tabs,
+    });
+    if (result.type === 'none') return;
+    if (result.type === 'move') {
+      void action({ type: 'MOVE_TAB', tabId: result.tabId, windowId: result.windowId, index: result.index });
+      return;
+    }
+    if (result.type === 'group') {
+      void action({ type: 'GROUP_TAB', tabId: result.tabId, groupId: result.groupId });
+      return;
+    }
+    if (result.type === 'ungroup') {
+      void action({ type: 'GROUP_TAB', tabId: result.tabId, groupId: -1 });
+      return;
+    }
+    if (result.type === 'ungroup-and-move') {
+      await action({ type: 'GROUP_TAB', tabId: result.tabId, groupId: -1 });
+      void action({ type: 'MOVE_TAB', tabId: result.tabId, windowId: result.windowId, index: result.index });
+      return;
+    }
+    if (result.type === 'stash') {
+      void stashSelection({ scope: 'tabs', tabIds: [result.tabId], includePinned: true, includeActive: true, busyLabel: t('stashingTab') });
+      return;
+    }
+    void fileDroppedTab(result.tabId, result.folderId, {
+      openTabs: liveSnapshot.windows.flatMap((window) => window.tabs),
+      request,
+      showToast,
+      t,
+    });
+  }, [action, request, showToast, stashSelection, t]);
 
   const groupSelectedTabs = async (tabIds: number[]) => {
     if (!currentWindow) return false;
@@ -268,12 +339,6 @@ function App() {
     const index = (snapshot?.windows.findIndex((window) => window.windowId === currentWindow.windowId) ?? 0) + 1;
     downloadTextFile(`zen-tab-window-${index}.json`, exportWindowAsJson(currentWindow, { now: Date.now(), name: t('windowExportName', { index }) }));
   }, [currentWindow, snapshot?.windows, t]);
-
-  useEffect(() => {
-    const clearBookmarkDrop = () => setBookmarkDropActive(false);
-    window.addEventListener('dragend', clearBookmarkDrop);
-    return () => window.removeEventListener('dragend', clearBookmarkDrop);
-  }, []);
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
@@ -370,10 +435,18 @@ function App() {
     }
   }, [load, request, showToast, t]);
 
-  if (!snapshot) return <main className="app-shell"><div className="empty-state"><p>{error ?? t('connectingToTabs')}</p></div></main>;
+  const atmosphereEnabled = snapshot?.settings.atmosphereEnabled ?? true;
+
+  if (!snapshot) return (
+    <main className="app-shell">
+      <AtmosphereCanvas enabled={atmosphereEnabled} />
+      <div className="empty-state"><p>{error ?? t('connectingToTabs')}</p></div>
+    </main>
+  );
 
   return (
     <main className="app-shell">
+      <AtmosphereCanvas enabled={atmosphereEnabled} />
       <header className="top-bar">
         <label className="search-box top-search">
           <Search size={16} />
@@ -398,29 +471,44 @@ function App() {
           />
           {search && <button className="search-clear" onClick={() => setSearch('')} aria-label={t('close')}><X size={13} /></button>}
         </label>
-        <button className="command-button compact accent" onClick={() => void runGroupAnalysis()} disabled={Boolean(busy)} aria-label={t('groupTabs')} title={t('groupTabs')}><Sparkles size={15} /> <span className="top-action-label">{t('groupTabs')}</span></button>
+        {section === 'bookmarks' ? (
+          <button className="command-button compact accent" onClick={() => bookmarkChrome?.openOrganize()} disabled={!bookmarkChrome || Boolean(busy)} aria-label={t('bookmarkOrganize')} title={t('bookmarkOrganize')}><ListFilter size={15} /> <span className="top-action-label">{t('bookmarkOrganize')}</span></button>
+        ) : (
+          <button className="command-button compact accent" onClick={() => void runGroupAnalysis()} disabled={Boolean(busy)} aria-label={t('groupTabs')} title={t('groupTabs')}><Sparkles size={15} /> <span className="top-action-label">{t('groupTabs')}</span></button>
+        )}
         <div className="organize-menu-wrap">
-          <button className="icon-button" onClick={() => setOrganizeMenuOpen((open) => !open)} disabled={Boolean(busy)} aria-expanded={organizeMenuOpen} aria-haspopup="menu" aria-label={t('moreActions')} title={t('organizeMenu')}><MoreHorizontal size={17} /></button>
-          {organizeMenuOpen && <div className="stash-popover organize-popover" role="menu" aria-label={t('organizeMenu')}>
-            <button className="stash-menu-item" role="menuitem" onClick={() => { setOrganizeMenuOpen(false); void runCleanupAnalysis(); }}>
-              <span className="stash-menu-icon" aria-hidden="true"><ListFilter size={15} /></span>
-              <span className="stash-menu-copy"><strong>{t('cleanUp')}</strong><small>{t('protectedPages')}</small></span>
-            </button>
-            <button className="stash-menu-item" role="menuitem" onClick={() => void stashSelection({ scope: 'window', includePinned: false, includeActive: false, busyLabel: t('stashingWindow') })}>
-              <span className="stash-menu-icon" aria-hidden="true"><PanelLeft size={15} /></span>
-              <span className="stash-menu-copy"><strong>{t('stashWindow')}</strong><small>{t('keepPinnedActive')}</small></span>
-            </button>
-            <button className="stash-menu-item" role="menuitem" onClick={() => void stashSelection({ scope: 'window', includePinned: true, includeActive: true, busyLabel: t('stashingAllTabs') })}>
-              <span className="stash-menu-icon" aria-hidden="true"><Layers3 size={15} /></span>
-              <span className="stash-menu-copy"><strong>{t('stashAllTabs')}</strong><small>{t('includePinnedActive')}</small></span>
-            </button>
-            <button className="stash-menu-item" role="menuitem" onClick={() => { setOrganizeMenuOpen(false); exportCurrentWindow(); }}>
-              <span className="stash-menu-icon" aria-hidden="true"><Archive size={15} /></span>
-              <span className="stash-menu-copy"><strong>{t('exportWindow')}</strong><small>JSON</small></span>
-            </button>
+          <button className="icon-button" onClick={() => setOrganizeMenuOpen((open) => !open)} disabled={Boolean(busy) || (section === 'bookmarks' && !bookmarkChrome)} aria-expanded={organizeMenuOpen} aria-haspopup="menu" aria-label={t('moreActions')} title={t('moreActions')}><MoreHorizontal size={17} /></button>
+          {organizeMenuOpen && <div className="stash-popover organize-popover" role="menu" aria-label={t('moreActions')}>
+            {section === 'bookmarks' ? <>
+              <button className="stash-menu-item" role="menuitem" disabled={!bookmarkChrome || bookmarkChrome.inboxCount === 0} onClick={() => { setOrganizeMenuOpen(false); bookmarkChrome?.openReview(); }}>
+                <span className="stash-menu-icon" aria-hidden="true"><Inbox size={15} /></span>
+                <span className="stash-menu-copy"><strong>{t('reviewInbox')}</strong><small>{t('unfiledBookmarkCount', { count: bookmarkChrome?.inboxCount ?? 0 })}</small></span>
+              </button>
+              <button className="stash-menu-item" role="menuitem" disabled={!bookmarkChrome} onClick={() => { setOrganizeMenuOpen(false); bookmarkChrome?.openExport(); }}>
+                <span className="stash-menu-icon" aria-hidden="true"><Download size={15} /></span>
+                <span className="stash-menu-copy"><strong>{t('exportBookmarks')}</strong><small>Markdown / HTML</small></span>
+              </button>
+            </> : <>
+              <button className="stash-menu-item" role="menuitem" onClick={() => { setOrganizeMenuOpen(false); void runCleanupAnalysis(); }}>
+                <span className="stash-menu-icon" aria-hidden="true"><ListFilter size={15} /></span>
+                <span className="stash-menu-copy"><strong>{t('cleanUp')}</strong><small>{t('protectedPages')}</small></span>
+              </button>
+              <button className="stash-menu-item" role="menuitem" onClick={() => void stashSelection({ scope: 'window', includePinned: false, includeActive: false, busyLabel: t('stashingWindow') })}>
+                <span className="stash-menu-icon" aria-hidden="true"><PanelLeft size={15} /></span>
+                <span className="stash-menu-copy"><strong>{t('stashWindow')}</strong><small>{t('keepPinnedActive')}</small></span>
+              </button>
+              <button className="stash-menu-item" role="menuitem" onClick={() => void stashSelection({ scope: 'window', includePinned: true, includeActive: true, busyLabel: t('stashingAllTabs') })}>
+                <span className="stash-menu-icon" aria-hidden="true"><Layers3 size={15} /></span>
+                <span className="stash-menu-copy"><strong>{t('stashAllTabs')}</strong><small>{t('includePinnedActive')}</small></span>
+              </button>
+              <button className="stash-menu-item" role="menuitem" onClick={() => { setOrganizeMenuOpen(false); exportCurrentWindow(); }}>
+                <span className="stash-menu-icon" aria-hidden="true"><Archive size={15} /></span>
+                <span className="stash-menu-copy"><strong>{t('exportWindow')}</strong><small>JSON</small></span>
+              </button>
+            </>}
           </div>}
         </div>
-        <button className="icon-button" aria-label={t('openSettings')} onClick={() => setModal('settings')} title={t('settings')}><Settings2 size={17} /></button>
+        <button className="icon-button" aria-label={t('openSettings')} onClick={() => setModal(modal === 'settings' ? null : 'settings')} title={t('settings')}><Settings2 size={17} /></button>
       </header>
 
       <div className="app-content">
@@ -430,6 +518,7 @@ function App() {
             bookmarks={paletteBookmarks}
             stashes={snapshot.stashes}
             query={search}
+            faviconGranted={faviconGranted}
             t={t}
             activeIndex={unifiedActiveIndex}
             onActiveIndexChange={setUnifiedActiveIndex}
@@ -455,6 +544,7 @@ function App() {
               windowSnapshot={currentWindow}
               search={search}
               t={t}
+              onTabDragEnd={(event) => { void commitTabDrag(event); }}
               onToggleGroup={(groupId, collapsed) => { void action({ type: 'UPDATE_GROUP', groupId, action: 'collapse', collapsed }); }}
               onStashGroup={(groupId) => { void stashSelection({ scope: 'group', groupId, includePinned: false, includeActive: true, busyLabel: t('stashingGroup') }); }}
               onStashUngrouped={() => {
@@ -491,28 +581,37 @@ function App() {
         )}
 
         {!search.trim() && section === 'bookmarks' && (
-          <BookmarkList
-            search={search}
-            bookmarkEpoch={bookmarkEpoch}
-            filingSuggestion={bookmarkFilingSuggestion}
-            openTabs={snapshot.windows.flatMap((window) => window.tabs)}
-            request={request}
-            showToast={showToast}
-            t={t}
-            onBookmarksChange={setPaletteBookmarks}
-            onDismissSuggestion={() => useZenTabStore.setState({ bookmarkFilingSuggestion: null })}
-          />
+          <div className="section-panel">
+            <BookmarkList
+              search={search}
+              bookmarkEpoch={bookmarkEpoch}
+              filingSuggestion={bookmarkFilingSuggestion}
+              openTabs={snapshot.windows.flatMap((window) => window.tabs)}
+              settings={snapshot.settings}
+              hasCloudApiKey={snapshot.hasCloudApiKey}
+              request={request}
+              showToast={showToast}
+              t={t}
+              onBookmarksChange={setPaletteBookmarks}
+              onDismissSuggestion={() => useZenTabStore.setState({ bookmarkFilingSuggestion: null })}
+              onChromeChange={setBookmarkChrome}
+            />
+          </div>
         )}
       </div>
 
       <nav className="bottom-nav" aria-label={t('zenTabSections')}>
         <button className={section === 'tabs' ? 'bottom-nav-item active' : 'bottom-nav-item'} onClick={() => setSection('tabs')}><Layers3 size={15} /> {t('tabs')} <span className="count-pill">{tabCount}</span></button>
-        <button className={`${section === 'stashes' ? 'bottom-nav-item active' : 'bottom-nav-item'}${stashDropActive ? ' drop-target' : ''}`} onClick={() => setSection('stashes')} onDragOver={(event) => { if (!event.dataTransfer.types.includes('text/tab-id')) return; event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setStashDropActive(true); }} onDragLeave={() => setStashDropActive(false)} onDrop={(event) => { event.preventDefault(); const tabId = Number(event.dataTransfer.getData('text/tab-id')); setStashDropActive(false); if (Number.isFinite(tabId)) void stashSelection({ scope: 'tabs', tabIds: [tabId], includePinned: true, includeActive: true, busyLabel: t('stashingTab') }); }} aria-label={t('stashLibrary')}><Archive size={15} /> {stashDropActive ? t('dropToStash') : t('stash')} <span className="count-pill">{snapshot.stashes.length}</span></button>
-        <button className={`${section === 'bookmarks' ? 'bottom-nav-item active' : 'bottom-nav-item'}${bookmarkDropActive ? ' drop-target' : ''}`} onClick={() => void openBookmarks()} onDragOver={(event) => { const next = bookmarkNavTabDragOver(event.dataTransfer.types, section); if (!next.accept) return; event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setBookmarkDropActive(true); if (next.switchToBookmarks) setSection('bookmarks'); }} onDragLeave={() => setBookmarkDropActive(false)} onDrop={(event) => { event.preventDefault(); const tabId = Number(event.dataTransfer.getData('text/tab-id')); setBookmarkDropActive(false); if (Number.isFinite(tabId)) void fileDroppedTab(tabId, undefined, { openTabs: snapshot.windows.flatMap((window) => window.tabs), request, showToast, t }); }}><Bookmark size={15} /> {bookmarkDropActive ? t('dropToFile') : t('bookmarks')}</button>
+        <DroppableSurface surface={{ kind: 'stash' }} as="button" type="button" className={section === 'stashes' ? 'bottom-nav-item active' : 'bottom-nav-item'} onClick={() => setSection('stashes')} aria-label={t('stashLibrary')}>
+          {(over) => <><Archive size={15} /> {over ? t('dropToStash') : t('stash')} <span className="count-pill">{snapshot.stashes.length}</span></>}
+        </DroppableSurface>
+        <DroppableSurface surface={{ kind: 'bookmark-nav' }} as="button" className={section === 'bookmarks' ? 'bottom-nav-item active' : 'bottom-nav-item'} onClick={() => void openBookmarks()}>
+          {(over) => <><Bookmark size={15} /> {over ? t('dropToFile') : t('bookmarks')}</>}
+        </DroppableSurface>
       </nav>
 
       {toast && <Toast key={toast.id} toast={toast} t={t} onDismiss={dismissToast} onUndo={() => void undo()} />}
-      <CommandPalette open={paletteOpen} windows={snapshot.windows} bookmarks={paletteBookmarks} stashes={snapshot.stashes} t={t} onClose={() => setPaletteOpen(false)} onRun={runPaletteItem} />
+      <CommandPalette open={paletteOpen} windows={snapshot.windows} bookmarks={paletteBookmarks} stashes={snapshot.stashes} faviconGranted={faviconGranted} t={t} onClose={() => setPaletteOpen(false)} onRun={runPaletteItem} />
       {modal === 'group' && draftGroupProposal && <GroupModal proposal={draftGroupProposal} tabs={proposalTabs} t={t} onChange={setDraftGroupProposal} onClose={() => setModal(null)} onApply={async (selectedIndexes) => { const selectedGroups = draftGroupProposal.groups.filter((group, index) => selectedIndexes.includes(index) && group.tabIds.length >= 2); if (!selectedGroups.length) { showToast({ id: `${Date.now()}`, tone: 'warning', message: t('noValidGroups') }); return; } if (selectedGroups.some((group) => !group.name.trim() || group.name.trim().length > 42)) { showToast({ id: `${Date.now()}`, tone: 'warning', message: t('invalidGroupName') }); return; } if (await action({ type: 'APPLY_GROUP_PROPOSAL', proposal: { ...draftGroupProposal, groups: selectedGroups } }, t('groupsCreated', { count: selectedGroups.length }), 'undo')) setModal(null); }} />}
       {modal === 'cleanup' && draftCleanupProposal && <CleanupModal proposal={draftCleanupProposal} t={t} onClose={() => setModal(null)} onApply={(tabIds) => applyCleanup(draftCleanupProposal, tabIds)} />}
       {modal === 'settings' && <SettingsPanel settings={snapshot.settings} hasCloudApiKey={snapshot.hasCloudApiKey} t={t} onClose={() => setModal(null)} onUpdate={updateSettingsSafe} onUpdateProvider={updateAIProvider} onUpdateCloudKey={async (apiKey) => { try { await request({ type: 'UPDATE_CLOUD_KEY', apiKey }); await load(); showToast({ id: `${Date.now()}`, tone: 'success', message: t('apiKeySaved') }); } catch (keyError) { showToast({ id: `${Date.now()}`, tone: 'error', message: keyError instanceof Error ? keyError.message : t('couldNotSaveApiKey') }); } }} onRequestDeepScanAll={requestDeepScanAll} onRequestDiscardInspect={requestPageAccessSetting} onClearProjectMemory={clearProjectMemory} />}

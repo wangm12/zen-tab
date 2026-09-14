@@ -46,6 +46,7 @@ export type AutoDiscardMinutes = 15 | 30 | 60 | 120;
 export type ZenTabSettings = {
   language: Language;
   theme: ThemePreference;
+  atmosphereEnabled: boolean;
   duplicateEnabled: boolean;
   duplicateScope: DuplicateScope;
   ignoredDomains: string[];
@@ -63,6 +64,7 @@ export type ZenTabSettings = {
 export const DEFAULT_SETTINGS: ZenTabSettings = {
   language: 'en',
   theme: 'system',
+  atmosphereEnabled: true,
   duplicateEnabled: true,
   duplicateScope: 'all-normal-windows',
   ignoredDomains: [],
@@ -160,17 +162,23 @@ export type ProjectMemoryRule = {
   useCount: number;
 };
 
+export type BookmarkFolderKind = 'bar' | 'other' | 'mobile' | 'folder' | 'managed';
+
+export type BookmarkOrganizeScope = 'unfiled' | 'bar' | 'other' | 'all';
+
 export type BookmarkRecord = {
   id: string;
   parentId: string;
   title: string;
   url: string;
   dateAdded?: number;
-  index?: number;
   folderPath: string;
   summary?: string;
   isInbox: boolean;
   isBookmarksBar: boolean;
+  folderKind: BookmarkFolderKind;
+  index: number;
+  unmodifiable?: 'managed';
 };
 
 export type BookmarkFolderRecord = {
@@ -181,7 +189,26 @@ export type BookmarkFolderRecord = {
   isInbox: boolean;
   isSpecialRoot: boolean;
   isBookmarksBar: boolean;
+  folderKind: BookmarkFolderKind;
+  index: number;
+  unmodifiable?: 'managed';
 };
+
+export type BookmarkOrganizeSnapshot = {
+  id: string
+  createdAt: number
+  expiresAt: number
+  moveCount: number
+  createdFolderIds: string[]
+  nodes: Array<{ id: string; parentId: string; index: number }>
+}
+
+export type BookmarkOrganizeSnapshotSummary = {
+  id: string
+  createdAt: number
+  expiresAt: number
+  moveCount: number
+}
 
 export type BookmarkFolderSuggestion = {
   folderId: string;
@@ -238,6 +265,8 @@ export type RecentSession = {
   title: string;
   tabCount: number;
   kind: 'tab' | 'window';
+  url?: string;
+  favIconUrl?: string;
 };
 
 export type ZenTabSnapshot = {
@@ -261,11 +290,31 @@ export type ZenTabMessage =
   | { type: 'GET_SNAPSHOT' }
   | { type: 'GET_BOOKMARK_TREE' }
   | { type: 'FILE_BOOKMARKS'; bookmarkIds: string[]; folderId: string }
+  | {
+    type: 'APPLY_BOOKMARK_FILING'
+    creates: Array<{ clientId: string; parentId: string; title: string }>
+    moves: Array<{ bookmarkId: string; folderId: string }>
+  }
+  | { type: 'ANALYZE_BOOKMARK_ORGANIZE'; scope?: BookmarkOrganizeScope }
+  | {
+    type: 'APPLY_BOOKMARK_ORGANIZE'
+    creates: Array<{ clientId: string; parentId: string; title: string }>
+    moves: Array<{ bookmarkId: string; folderId: string }>
+    scope?: BookmarkOrganizeScope
+  }
+  | { type: 'RESTORE_BOOKMARK_ORGANIZE'; snapshotId: string }
+  | { type: 'GET_BOOKMARK_ORGANIZE_SNAPSHOTS' }
   | { type: 'APPLY_BOOKMARK_DEDUP'; groups: Array<{ keepId: string; removeIds: string[] }> }
   | { type: 'SUGGEST_BOOKMARK_FILE'; bookmarkId: string }
   | { type: 'RUN_GROUP_ANALYSIS'; windowId: number; deepScanAll?: boolean; tabIds?: number[] }
   | { type: 'GROUP_TABS'; windowId: number; tabIds: number[]; title?: string; color?: GroupColor }
   | { type: 'CREATE_BOOKMARKS'; folderId?: string; tabs: Array<{ title: string; url: string }> }
+  | { type: 'UPDATE_BOOKMARK'; id: string; title: string; url?: string }
+  | { type: 'REMOVE_BOOKMARK'; id: string }
+  | { type: 'CREATE_BOOKMARK_FOLDER'; parentId: string; title: string }
+  | { type: 'REMOVE_BOOKMARK_FOLDER'; id: string }
+  | { type: 'MOVE_BOOKMARK'; id: string; parentId: string; index?: number }
+  | { type: 'OPEN_BOOKMARK_URLS'; urls: string[] }
   | { type: 'APPLY_GROUP_PROPOSAL'; proposal: GroupProposal }
   | { type: 'RUN_CLEANUP_ANALYSIS'; windowId: number }
   | { type: 'APPLY_CLEANUP'; proposal: CleanupProposal; tabIds: number[] }

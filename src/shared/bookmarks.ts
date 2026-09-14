@@ -1,5 +1,6 @@
 import {
   BookmarkDuplicateGroup,
+  BookmarkFolderKind,
   BookmarkFolderRecord,
   BookmarkFolderSuggestion,
   BookmarkRecord,
@@ -12,6 +13,7 @@ const BAR_ROOT_TITLES = new Set(['bookmarks bar', '书签栏']);
 const MOBILE_ROOT_TITLES = new Set(['mobile bookmarks', '移动设备书签']);
 type BookmarkTreeNodeWithFolderType = chrome.bookmarks.BookmarkTreeNode & {
   folderType?: 'bookmarks-bar' | 'other' | 'mobile' | 'managed';
+  unmodifiable?: 'managed';
 };
 
 export type BookmarkFileMove = {
@@ -21,11 +23,126 @@ export type BookmarkFileMove = {
   toParentId: string;
 };
 
+export type BookmarkIndexMove = {
+  id: string;
+  fromParentId: string;
+  fromIndex: number;
+  toParentId: string;
+  toIndex: number;
+};
+
+export function shouldRestoreMovedBookmark(
+  move: BookmarkIndexMove,
+  liveNode: { parentId?: string; index?: number } | undefined,
+): boolean {
+  if (!liveNode) return false;
+  const leftDestination = liveNode.parentId !== move.fromParentId || liveNode.index !== move.fromIndex;
+  return leftDestination
+    && liveNode.parentId === move.toParentId
+    && liveNode.index === move.toIndex;
+}
+
 export function shouldRestoreFiledBookmark(
   move: BookmarkFileMove,
   liveNode: chrome.bookmarks.BookmarkTreeNode | undefined,
 ): boolean {
   return Boolean(liveNode && liveNode.parentId !== move.fromParentId && liveNode.parentId === move.toParentId);
+}
+
+export function otherBookmarksRootId(folders: BookmarkFolderRecord[]): string | undefined {
+  return folders.find((folder) => folder.folderKind === 'other')?.id;
+}
+
+export function canMutateBookmarkNode(node: {
+  folderKind: BookmarkFolderKind;
+  unmodifiable?: 'managed';
+}): boolean {
+  return node.folderKind !== 'bar'
+    && node.folderKind !== 'other'
+    && node.folderKind !== 'mobile'
+    && node.folderKind !== 'managed'
+    && node.unmodifiable !== 'managed';
+}
+
+export function isManagedBookmarkNode(id: string, folders: BookmarkFolderRecord[]): boolean {
+  const byId = new Map(folders.map((folder) => [folder.id, folder]));
+  let current = byId.get(id);
+  while (current) {
+    if (current.folderKind === 'managed' || current.unmodifiable === 'managed') return true;
+    if (!current.parentId) break;
+    current = byId.get(current.parentId);
+  }
+  return false;
+}
+
+export function canFileIntoBookmarkParent(parentId: string, folders: BookmarkFolderRecord[]): boolean {
+  if (isManagedBookmarkNode(parentId, folders)) return false;
+  const dest = folders.find((folder) => folder.id === parentId);
+  if (!dest) return false;
+  return dest.folderKind === 'bar' || dest.folderKind === 'other' || dest.folderKind === 'folder';
+}
+
+export function filingDestinationFolders(folders: BookmarkFolderRecord[]): BookmarkFolderRecord[] {
+  return folders.filter((folder) => (
+    !folder.isSpecialRoot && !folder.isInbox && canFileIntoBookmarkParent(folder.id, folders)
+  ));
+}
+
+export function folderCreateParentFolders(folders: BookmarkFolderRecord[]): BookmarkFolderRecord[] {
+  return folders.filter((folder) => !folder.isInbox && canFileIntoBookmarkParent(folder.id, folders));
+}
+
+export function assertFileableBookmarkParent(parentId: string, folders: BookmarkFolderRecord[]): void {
+  if (!canFileIntoBookmarkParent(parentId, folders)) {
+    throw new Error('That bookmark cannot be changed.');
+  }
+}
+
+export function assertMutableBookmarkNode(
+  live: { id: string; url?: string; unmodifiable?: string; parentId?: string },
+  folders: BookmarkFolderRecord[],
+): void {
+  if (live.unmodifiable === 'managed') {
+    throw new Error('That bookmark cannot be changed.');
+  }
+  if (isManagedBookmarkNode(live.id, folders) || (live.parentId && isManagedBookmarkNode(live.parentId, folders))) {
+    throw new Error('That bookmark cannot be changed.');
+  }
+  const folder = folders.find((item) => item.id === live.id);
+  if (folder) {
+    if (!canMutateBookmarkNode(folder)) {
+      throw new Error('That bookmark cannot be changed.');
+    }
+    return;
+  }
+  if (!live.url) {
+    throw new Error('That bookmark is no longer available.');
+  }
+}
+
+export function bookmarkMoveIndex(input: {
+  fromIndex: number;
+  targetIndex: number;
+  placement: 'before' | 'after';
+  sameParent?: boolean;
+}): number {
+  return input.placement === 'after' ? input.targetIndex + 1 : input.targetIndex;
+}
+
+export function isBookmarkMoveCycle(
+  movingFolderId: string,
+  destParentId: string,
+  folders: BookmarkFolderRecord[],
+): boolean {
+  if (destParentId === movingFolderId) return true;
+  const byId = new Map(folders.map((folder) => [folder.id, folder]));
+  let current = byId.get(destParentId);
+  while (current) {
+    if (current.id === movingFolderId) return true;
+    if (!current.parentId) break;
+    current = byId.get(current.parentId);
+  }
+  return false;
 }
 
 export function canRestoreBookmarkIntoParent(
@@ -92,13 +209,18 @@ function normalizedTitle(title: string): string {
   return title.trim().toLocaleLowerCase();
 }
 
-function rootKind(node: BookmarkTreeNodeWithFolderType): 'bar' | 'other' | 'mobile' | null {
+function rootKind(
+  node: BookmarkTreeNodeWithFolderType,
+  isDirectRootChild: boolean,
+): 'bar' | 'other' | 'mobile' | 'managed' | null {
   if (node.id === '1') return 'bar';
   if (node.id === '2') return 'other';
   if (node.id === '3') return 'mobile';
   if (node.folderType === 'bookmarks-bar') return 'bar';
   if (node.folderType === 'other') return 'other';
   if (node.folderType === 'mobile') return 'mobile';
+  if (node.folderType === 'managed' || node.unmodifiable === 'managed') return 'managed';
+  if (!isDirectRootChild) return null;
   const title = normalizedTitle(node.title);
   if (BAR_ROOT_TITLES.has(title)) return 'bar';
   if (OTHER_ROOT_TITLES.has(title)) return 'other';
@@ -116,7 +238,8 @@ export function flattenBookmarkTree(nodes: chrome.bookmarks.BookmarkTreeNode[]):
   const visit = (
     node: chrome.bookmarks.BookmarkTreeNode,
     path: string[],
-    parentKind: ReturnType<typeof rootKind>,
+    inheritedKind: ReturnType<typeof rootKind>,
+    immediateParentKind: ReturnType<typeof rootKind>,
     insideInbox: boolean,
     parentIsInvisibleRoot: boolean,
   ) => {
@@ -127,17 +250,20 @@ export function flattenBookmarkTree(nodes: chrome.bookmarks.BookmarkTreeNode[]):
         title: node.title,
         url: node.url,
         dateAdded: node.dateAdded,
-        index: node.index,
         folderPath: path.join(' / '),
-        isInbox: parentKind === 'other' || insideInbox,
-        isBookmarksBar: parentKind === 'bar',
+        isInbox: immediateParentKind === 'other' || insideInbox,
+        isBookmarksBar: inheritedKind === 'bar',
+        folderKind: inheritedKind ?? 'folder',
+        index: node.index ?? 0,
+        ...(node.unmodifiable === 'managed' ? { unmodifiable: 'managed' as const } : {}),
       });
       return;
     }
 
-    const kind = rootKind(node);
     const isInvisibleRoot = node.parentId == null && !node.title;
     const isDirectRootChild = node.parentId === '0' || parentIsInvisibleRoot;
+    const ownKind = rootKind(node, isDirectRootChild);
+    const childKind = ownKind ?? inheritedKind;
     const nextPath = isInvisibleRoot ? path : [...path, node.title];
     const nodeIsInbox = insideInbox || normalizedTitle(node.title) === 'inbox';
     if (!isInvisibleRoot) {
@@ -147,21 +273,24 @@ export function flattenBookmarkTree(nodes: chrome.bookmarks.BookmarkTreeNode[]):
         title: node.title,
         folderPath: nextPath.join(' / '),
         isInbox: nodeIsInbox,
-        isSpecialRoot: kind !== null
+        isSpecialRoot: ownKind !== null
           || isDirectRootChild
           || (node as BookmarkTreeNodeWithFolderType).folderType === 'managed',
-        isBookmarksBar: kind === 'bar',
+        isBookmarksBar: ownKind === 'bar',
+        folderKind: ownKind ?? (node.unmodifiable === 'managed' ? 'managed' : 'folder'),
+        index: node.index ?? 0,
+        ...(node.unmodifiable === 'managed' ? { unmodifiable: 'managed' as const } : {}),
       });
     }
-    for (const child of node.children ?? []) visit(child, nextPath, kind, nodeIsInbox, isInvisibleRoot);
+    for (const child of node.children ?? []) visit(child, nextPath, childKind, ownKind, nodeIsInbox, isInvisibleRoot);
   };
 
-  for (const node of nodes) visit(node, [], null, false, false);
+  for (const node of nodes) visit(node, [], null, null, false, false);
   return { bookmarks, folders };
 }
 
 function eligibleFolders(folders: BookmarkFolderRecord[]): BookmarkFolderRecord[] {
-  return folders.filter((folder) => !folder.isSpecialRoot && !folder.isInbox);
+  return filingDestinationFolders(folders);
 }
 
 function tokenOverlap(left: Iterable<string>, right: Iterable<string>): number {

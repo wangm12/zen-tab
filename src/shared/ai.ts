@@ -366,7 +366,40 @@ export function isAbortError(error: unknown): boolean {
 }
 
 function cleanJsonResult(result: string): unknown {
-  return JSON.parse(result.replace(/^```json\s*/i, '').replace(/\s*```$/i, '')) as unknown;
+  const trimmed = result.trim();
+  const codeBlockMatches = trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/gi);
+  for (const match of codeBlockMatches) {
+    try {
+      return JSON.parse(match[1].trim());
+    } catch {
+      const candidate = match[1].trim();
+      const firstBrace = candidate.indexOf('{');
+      const lastBrace = candidate.lastIndexOf('}');
+      if (firstBrace !== -1 && lastBrace > firstBrace) {
+        try {
+          return JSON.parse(candidate.slice(firstBrace, lastBrace + 1));
+        } catch {
+          // continue
+        }
+      }
+    }
+  }
+
+  try {
+    return JSON.parse(trimmed.replace(/^```json\s*/i, '').replace(/\s*```$/i, ''));
+  } catch {
+    const firstBrace = trimmed.indexOf('{');
+    const lastBrace = trimmed.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+    }
+    const firstBracket = trimmed.indexOf('[');
+    const lastBracket = trimmed.lastIndexOf(']');
+    if (firstBracket !== -1 && lastBracket > firstBracket) {
+      return JSON.parse(trimmed.slice(firstBracket, lastBracket + 1));
+    }
+    throw new Error('Failed to parse AI JSON response');
+  }
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
@@ -420,7 +453,7 @@ function cleanupPrompt(input: ProjectTabInput[], protectedDomains: string[]): st
   ].join('\n');
 }
 
-async function requestLocalJson(prompt: string, systemPrompt = 'You are a precise project-context classifier.'): Promise<unknown | null> {
+export async function requestLocalJson(prompt: string, systemPrompt = 'You are a precise project-context classifier.'): Promise<unknown | null> {
   const api = localModelApi();
   if (!api) return null;
   let session: Awaited<ReturnType<typeof api.create>> | undefined;
@@ -440,7 +473,7 @@ async function requestLocalModel(input: ProjectTabInput[], language: Language): 
   return raw ? parseProposal(raw, input, 'local-model') : null;
 }
 
-async function requestCloudJson(prompt: string, settings: ZenTabSettings, apiKey: string, systemPrompt = 'You are a careful browser project classifier.'): Promise<unknown | null> {
+export async function requestCloudJson(prompt: string, settings: ZenTabSettings, apiKey: string, systemPrompt = 'You are a careful browser project classifier.'): Promise<unknown | null> {
   if (!apiKey) return null;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);

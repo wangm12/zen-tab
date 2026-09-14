@@ -2,14 +2,6 @@ import { BOOKMARK_WORKSPACE_PERMISSIONS } from '../shared/bookmark-favicon';
 import { TabRecord, ToastMessage, ZenTabMessage } from '../shared/types';
 import { Translator } from './i18n';
 
-export function bookmarkNavTabDragOver(
-  types: readonly string[],
-  section: string,
-): { accept: boolean; switchToBookmarks: boolean } {
-  if (!types.includes('text/tab-id')) return { accept: false, switchToBookmarks: false };
-  return { accept: true, switchToBookmarks: section !== 'bookmarks' };
-}
-
 export type FileDroppedTabDeps = {
   openTabs: Array<Pick<TabRecord, 'tabId' | 'title' | 'url'>>;
   request: <T = unknown>(message: ZenTabMessage) => Promise<T>;

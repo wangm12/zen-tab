@@ -1,39 +1,103 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Bookmark, ChevronDown, ChevronRight, Globe2, RefreshCw, Sparkles, Trash2, X } from 'lucide-react';
+import { memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
+import {
+  Bookmark, ChevronDown, ChevronRight, FolderPlus, Globe2, MoreHorizontal, Pencil, RefreshCw, Sparkles, Trash2, X,
+} from 'lucide-react';
+import {
+  collectFolderUrls,
+  firstViewportIndex,
+  folderSurfaceColor,
+  INBOX_SURFACE_COLOR,
+  pickFaviconStack,
+  resolveStickyGroup,
+  stickyHeaderHasScrolledAway,
+} from '../shared/atmosphere';
+import {
+  bookmarkPlaceholderDest,
+  coerceBookmarkDragHit,
+  findRootFolderRecord,
+  formatBookmarkFolderRowId,
+  formatBookmarkRowId,
+  isRootBookmarkFolder,
+  parseBookmarkDragSource,
+  placeBookmarkPlaceholder,
+  resolveBookmarkDragEnd,
+  resolveBookmarkFolderHeaderHit,
+  resolveBookmarkItemDropHit,
+  settleBookmarkPlaceholder,
+  type BookmarkDisplayRow,
+  type BookmarkDragOver,
+  type BookmarkDragSource,
+} from '../shared/bookmark-dnd';
 import { BOOKMARK_WORKSPACE_PERMISSIONS, chromeFaviconUrl, readFaviconGranted, resolveBookmarkFavicon } from '../shared/bookmark-favicon';
 import { searchBookmarks } from '../shared/bookmark-search';
-import { BookmarkForestNode, buildBookmarkForest, inboxBookmarks } from '../shared/bookmark-tree';
-import { findBookmarkDuplicateGroups } from '../shared/bookmarks';
-import { extractGroupingPageTextInPage } from '../shared/page-text';
+import { getBuiltInAiStatus } from '../shared/ai';
 import {
-  BookmarkDuplicateGroup,
+  buildTopicAnalyzePayload,
+  requestTopicOrganizeJson,
+  selectAnalyzeBookmarks,
+  topicProposalFromModel,
+} from '../shared/bookmark-organize-ai';
+import {
+  formatOrganizeSnapshotTime,
+  mergeTopicWithHostOrganize,
+  proposeBookmarkOrganize,
+  type BookmarkOrganizeProposal,
+} from '../shared/bookmark-organize';
+import { bookmarkUndoToastKey } from '../shared/bookmark-toasts';
+import {
+  COLLAPSED_BOOKMARK_FOLDERS_KEY,
+  largeFolderIdsToCollapse,
+  readCollapsedFolderIds,
+  resolveCollapsedFolderIds,
+  toggleCollapsedFolderId,
+} from '../shared/bookmark-collapse';
+import { BookmarkForestNode, buildBookmarkForest, flattenVisibleBookmarkRows, INBOX_COLLAPSE_ID, inboxBookmarks } from '../shared/bookmark-tree';
+import { canMutateBookmarkNode, filingDestinationFolders, findBookmarkDuplicateGroups, isManagedBookmarkNode, otherBookmarksRootId } from '../shared/bookmarks';
+import { extractGroupingPageTextInPage } from '../shared/page-text';
+import { dropPositionFromPoint } from '../shared/tab-ops';
+import { formatTabDragId, parseTabDragId, rememberTabDragHit, TAB_DROP_ATTR, type DragSurface } from '../shared/tab-dnd';
+import {
   BookmarkFolderRecord,
   BookmarkFolderSuggestion,
+  BookmarkOrganizeScope,
+  BookmarkOrganizeSnapshotSummary,
   BookmarkRecord,
   TabRecord,
   ToastMessage,
   ZenTabEvent,
   ZenTabMessage,
+  ZenTabSettings,
 } from '../shared/types';
 import { canonicalizeUrl } from '../shared/url';
+import { BookmarkEditPanel } from './BookmarkEditPanel';
+import { BookmarkExportSheet } from './BookmarkExportSheet';
+import { BookmarkFilingSheet } from './BookmarkFilingSheet';
+import { BookmarkHealthSheet } from './BookmarkHealthSheet';
 import { ContextMenu, ContextMenuItem } from './ContextMenu';
 import { buildBookmarkGroupContextSpecs, buildBookmarkRowContextSpecs } from './context-menu';
-import { fileDroppedTab } from './file-dropped-tab';
+import { DragPreviewOverlay } from './DragPreviewOverlay';
+import { DroppableSurface } from './dnd-surfaces';
+import { FaviconStack } from './FaviconStack';
 import { Translator } from './i18n';
+import { setTabDragOverId } from './tab-drag-over';
+import { usePointerDragSession } from './use-pointer-drag-session';
 
 const BOOKMARK_SUMMARIES_KEY = 'zen-tab.bookmark-summaries';
 const MAX_BOOKMARK_SUMMARIES = 200;
+const BOOKMARK_STICKY_KINDS = ['folder', 'inbox', 'search'] as const;
+
+export type BookmarkChrome = {
+  inboxCount: number;
+  openOrganize: () => void;
+  openExport: () => void;
+  openReview: () => void;
+};
 
 type BookmarkTreeData = {
   granted: boolean;
   bookmarks: BookmarkRecord[];
   folders: BookmarkFolderRecord[];
-};
-
-type FilingDraft = {
-  bookmarkId: string;
-  suggestion: BookmarkFolderSuggestion | null;
-  folderId: string;
 };
 
 function hostLabel(url: string): string {
@@ -44,8 +108,166 @@ function hostLabel(url: string): string {
   }
 }
 
-function eligibleFolders(folders: BookmarkFolderRecord[]): BookmarkFolderRecord[] {
-  return folders.filter((folder) => !folder.isSpecialRoot && !folder.isInbox);
+
+function canMutateRecord(node: BookmarkRecord | BookmarkFolderRecord, folders: BookmarkFolderRecord[]): boolean {
+  if (isManagedBookmarkNode(node.id, folders) || (node.parentId && isManagedBookmarkNode(node.parentId, folders))) {
+    return false;
+  }
+  if ('url' in node) {
+    return canMutateBookmarkNode({
+      folderKind: node.folderKind === 'managed' ? 'managed' : 'folder',
+      unmodifiable: node.unmodifiable,
+    });
+  }
+  return canMutateBookmarkNode(node);
+}
+
+function readBookmarkDragOver(
+  clientX: number,
+  clientY: number,
+  folders: BookmarkFolderRecord[],
+  sourceId?: string,
+  collapsedFolders?: ReadonlySet<string>,
+  localX?: number,
+): { over: BookmarkDragOver; placement?: 'before' | 'after' } | null {
+  const raw = document.elementFromPoint(clientX, clientY);
+  if (!raw || !('closest' in raw)) return null;
+
+  const source = parseBookmarkDragSource(sourceId ?? '');
+  const isFolderDrag = source?.type === 'folder';
+  const isDraggedRoot = isFolderDrag && isRootBookmarkFolder(source.id, folders);
+  const isLeftRail = localX !== undefined && localX < 36;
+
+  const tabNode = raw.closest(`[${TAB_DROP_ATTR}]`);
+  const tabSurface = tabNode ? parseTabDragId(tabNode.getAttribute(TAB_DROP_ATTR) ?? '') : null;
+  if (tabSurface?.kind === 'bookmark-folder' && tabNode) {
+    const dest = folders.find((folder) => folder.id === tabSurface.folderId);
+    const rect = tabNode.getBoundingClientRect();
+    const yRatio = rect.height === 0 ? 0.5 : (clientY - rect.top) / rect.height;
+    const placement = dropPositionFromPoint(clientY, rect.top, rect.height);
+    const parentId = tabNode.getAttribute('data-bookmark-parent') ?? dest?.parentId ?? '';
+    const index = Number(tabNode.getAttribute('data-bookmark-index') ?? dest?.index ?? 0);
+    const hit = resolveBookmarkFolderHeaderHit({
+      sourceType: source?.type,
+      folderId: tabSurface.folderId,
+      parentId,
+      index,
+      isSpecialRoot: Boolean(dest?.isSpecialRoot),
+      isExpanded: Boolean(collapsedFolders && !collapsedFolders.has(tabSurface.folderId)),
+      placement,
+      yRatio,
+    });
+
+    if (isFolderDrag && (isDraggedRoot || isLeftRail) && hit.over.kind === 'bookmark-folder-row') {
+      const rootFolder = findRootFolderRecord(tabSurface.folderId, folders);
+      if (rootFolder && rootFolder.id !== tabSurface.folderId && rootFolder.id !== source.id) {
+        return {
+          over: {
+            kind: 'bookmark-folder-row',
+            id: rootFolder.id,
+            parentId: rootFolder.parentId ?? '',
+            index: rootFolder.index,
+          },
+          placement: 'after',
+        };
+      }
+    }
+
+    return hit;
+  }
+  if (tabSurface && (
+    tabSurface.kind === 'bookmark-inbox'
+    || tabSurface.kind === 'bookmark-nav'
+    || tabSurface.kind === 'stash'
+  )) {
+    return { over: tabSurface };
+  }
+  const rowNode = raw.closest('[data-bookmark-drop]');
+  if (rowNode) {
+    const dropAttr = rowNode.getAttribute('data-bookmark-drop') ?? '';
+    if (dropAttr.startsWith('bookmark-empty-slot-')) {
+      const folderId = dropAttr.slice('bookmark-empty-slot-'.length);
+      return { over: { kind: 'bookmark-folder', folderId } };
+    }
+    const parsed = parseBookmarkDragSource(dropAttr);
+    if (parsed) {
+      const rect = rowNode.getBoundingClientRect();
+      const placement = dropPositionFromPoint(clientY, rect.top, rect.height);
+      const parentId = rowNode.getAttribute('data-bookmark-parent') ?? '';
+      const index = Number(rowNode.getAttribute('data-bookmark-index') ?? 0);
+      return resolveBookmarkItemDropHit({
+        sourceType: source?.type,
+        sourceId: source?.id,
+        isDraggedRoot,
+        isLeftRail,
+        hoveredKind: parsed.type,
+        hoveredId: parsed.id,
+        parentId,
+        index,
+        folders,
+        placement,
+      });
+    }
+  }
+  return tabSurface ? { over: tabSurface } : null;
+}
+
+function findLastVisibleDropTarget(
+  rows: readonly BookmarkDisplayRow[],
+  draggedKey: string,
+  sourceType?: BookmarkDragSource['type'],
+): { over: BookmarkDragOver; placement: 'after' } | null {
+  if (sourceType === 'folder') {
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      if (row.kind === 'folder' && row.depth === 0) {
+        const folderRowId = formatBookmarkFolderRowId(row.folder.id);
+        if (folderRowId !== draggedKey) {
+          return {
+            over: {
+              kind: 'bookmark-folder-row',
+              id: row.folder.id,
+              parentId: row.folder.parentId ?? '',
+              index: row.folder.index,
+            },
+            placement: 'after',
+          };
+        }
+      }
+    }
+  }
+
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+    if (row.kind === 'bookmark') {
+      const rowId = formatBookmarkRowId(row.bookmark.id);
+      if (rowId !== draggedKey) {
+        return {
+          over: {
+            kind: 'bookmark-row',
+            id: row.bookmark.id,
+            parentId: row.bookmark.parentId,
+            index: row.bookmark.index,
+          },
+          placement: 'after',
+        };
+      }
+    } else if (row.kind === 'folder') {
+      const folderRowId = formatBookmarkFolderRowId(row.folder.id);
+      if (folderRowId !== draggedKey) {
+        return {
+          over: {
+            kind: 'bookmark-folder-row',
+            id: row.folder.id,
+            parentId: row.folder.parentId ?? '',
+            index: row.folder.index,
+          },
+          placement: 'after',
+        };
+      }
+    }
+  }
+  return null;
 }
 
 export function BookmarkList({
@@ -53,21 +275,27 @@ export function BookmarkList({
   bookmarkEpoch,
   filingSuggestion,
   openTabs,
+  settings,
+  hasCloudApiKey,
   request,
   showToast,
   t,
   onBookmarksChange,
   onDismissSuggestion,
+  onChromeChange,
 }: {
   search: string;
   bookmarkEpoch: number;
   filingSuggestion: Extract<ZenTabEvent, { type: 'BOOKMARK_FILING_SUGGESTED' }> | null;
   openTabs: TabRecord[];
+  settings: ZenTabSettings;
+  hasCloudApiKey: boolean;
   request: <T = unknown>(message: ZenTabMessage) => Promise<T>;
   showToast: (toast: ToastMessage) => void;
   t: Translator;
   onBookmarksChange: (bookmarks: BookmarkRecord[]) => void;
   onDismissSuggestion: () => void;
+  onChromeChange?: (chrome: BookmarkChrome | null) => void;
 }) {
   const [permissionGranted, setPermissionGranted] = useState<boolean | null>(null);
   const [faviconGranted, setFaviconGranted] = useState(false);
@@ -75,19 +303,43 @@ export function BookmarkList({
   const [folders, setFolders] = useState<BookmarkFolderRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
-  const [filingDraft, setFilingDraft] = useState<FilingDraft | null>(null);
-  const [duplicateGroups, setDuplicateGroups] = useState<BookmarkDuplicateGroup[] | null>(null);
+  const [reviewSheet, setReviewSheet] = useState<{
+    rows: Array<{ bookmark: BookmarkRecord; suggestion: BookmarkFolderSuggestion | null }>;
+    focusBookmarkId?: string;
+  } | null>(null);
+  const [healthOpen, setHealthOpen] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [builtInAvailable, setBuiltInAvailable] = useState(false);
+  const [topicResult, setTopicResult] = useState<null | {
+    proposal: BookmarkOrganizeProposal;
+    analyzedCount: number;
+    eligibleCount: number;
+  }>(null);
+  const [organizeSnapshots, setOrganizeSnapshots] = useState<BookmarkOrganizeSnapshotSummary[]>([]);
+  const [exportOpen, setExportOpen] = useState(false);
   const [canEnrich, setCanEnrich] = useState(false);
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(() => new Set());
-  const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; label: string; items: ContextMenuItem[] } | null>(null);
+  const [overflowCloseToken, setOverflowCloseToken] = useState(0);
+  const [editDraft, setEditDraft] = useState<
+    | { kind: 'bookmark'; id: string; title: string; url: string }
+    | { kind: 'folder'; id: string; title: string }
+    | { kind: 'create-folder'; parentId: string; title: string }
+    | null
+  >(null);
+  const [visualRows, setVisualRows] = useState<BookmarkDisplayRow[] | null>(null);
+  const collapseSeededRef = useRef(false);
+  const analyzeGen = useRef(0);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const cloudReady = settings.aiProvider === 'openai-compatible' && hasCloudApiKey;
+  const topicReady = cloudReady || builtInAvailable;
 
   const loadTree = useCallback(async () => {
     setLoading(true);
     try {
       const [data, stored] = await Promise.all([
         request<BookmarkTreeData>({ type: 'GET_BOOKMARK_TREE' }),
-        chrome.storage.local.get(BOOKMARK_SUMMARIES_KEY),
+        chrome.storage.local.get([BOOKMARK_SUMMARIES_KEY, COLLAPSED_BOOKMARK_FOLDERS_KEY]),
       ]);
       setPermissionGranted(data.granted);
       if (!data.granted) {
@@ -103,6 +355,18 @@ export function BookmarkList({
       setBookmarks(enriched);
       setFolders(data.folders);
       onBookmarksChange(enriched);
+      if (!collapseSeededRef.current) {
+        collapseSeededRef.current = true;
+        const forest = buildBookmarkForest(data.folders, enriched);
+        const next = resolveCollapsedFolderIds(
+          stored[COLLAPSED_BOOKMARK_FOLDERS_KEY],
+          largeFolderIdsToCollapse(forest),
+        );
+        setCollapsedFolders(new Set(next));
+        if (readCollapsedFolderIds(stored[COLLAPSED_BOOKMARK_FOLDERS_KEY]) === null) {
+          void chrome.storage.local.set({ [COLLAPSED_BOOKMARK_FOLDERS_KEY]: next });
+        }
+      }
     } catch (error) {
       showToast({
         id: `${Date.now()}`,
@@ -153,111 +417,560 @@ export function BookmarkList({
   }, [bookmarkEpoch, loadTree, permissionGranted]);
 
   useEffect(() => {
-    const clearDropTarget = () => setDropTarget(null);
-    window.addEventListener('dragend', clearDropTarget);
-    return () => window.removeEventListener('dragend', clearDropTarget);
-  }, []);
-
-  useEffect(() => {
     void chrome.permissions.contains({ permissions: ['scripting'], origins: ['<all_urls>'] })
       .then(setCanEnrich)
       .catch(() => setCanEnrich(false));
   }, []);
 
-  const availableFolders = useMemo(() => eligibleFolders(folders), [folders]);
+  const availableFolders = useMemo(() => filingDestinationFolders(folders), [folders]);
   const inbox = useMemo(() => inboxBookmarks(bookmarks, folders), [bookmarks, folders]);
-  const inboxIds = useMemo(() => new Set(inbox.map((bookmark) => bookmark.id)), [inbox]);
   const forest = useMemo(() => buildBookmarkForest(folders, bookmarks), [bookmarks, folders]);
+  const healthGroups = useMemo(() => findBookmarkDuplicateGroups(bookmarks), [bookmarks]);
   const searchHits = useMemo(
     () => search.trim() ? searchBookmarks(bookmarks, search).map((result) => result.bookmark) : [],
     [bookmarks, search],
   );
+  const otherRootId = useMemo(() => otherBookmarksRootId(folders), [folders]);
+  const searching = Boolean(search.trim());
+  const includeInbox = !searching && inbox.length > 0;
+  const visibleRows = useMemo(() => flattenVisibleBookmarkRows({
+    forest: forest,
+    collapsedFolderIds: collapsedFolders,
+    inbox,
+    includeInbox,
+    searching,
+    searchHits,
+  }), [collapsedFolders, forest, includeInbox, inbox, searchHits, searching]);
+  const displayRows = visualRows ?? visibleRows;
+  const sortableEnabled = !searching;
+  const folderChildren = useMemo(() => {
+    const map = new Map<string, BookmarkForestNode[]>();
+    const walk = (nodes: BookmarkForestNode[]) => {
+      for (const node of nodes) {
+        if (node.kind !== 'folder') continue;
+        map.set(node.folder.id, node.children);
+        walk(node.children);
+      }
+    };
+    walk(forest);
+    return map;
+  }, [forest]);
+  const openCanonicalUrls = useMemo(
+    () => new Set(openTabs.map((tab) => canonicalizeUrl(tab.url)).filter((url): url is string => Boolean(url))),
+    [openTabs],
+  );
+  const virtualizer = useVirtualizer({
+    count: displayRows.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: (index) => {
+      const row = displayRows[index];
+      return row?.kind === 'bookmark' || row?.kind === 'placeholder' ? 54 : 52;
+    },
+    overscan: 8,
+  });
 
   const openContextMenu = useCallback((event: React.MouseEvent, items: ContextMenuItem[], label: string) => {
     event.preventDefault();
     event.stopPropagation();
+    setOverflowCloseToken((token) => token + 1);
     setContextMenu({ x: event.clientX, y: event.clientY, items, label });
   }, []);
+  const onOpenOverflow = useCallback(() => setContextMenu(null), []);
 
   const toggleFolder = useCallback((folderId: string) => {
-    setCollapsedFolders((current) => {
-      const next = new Set(current);
-      if (next.has(folderId)) next.delete(folderId);
-      else next.add(folderId);
-      return next;
+    startTransition(() => {
+      setCollapsedFolders((current) => {
+        const next = toggleCollapsedFolderId(current, folderId);
+        void chrome.storage.local.set({ [COLLAPSED_BOOKMARK_FOLDERS_KEY]: next });
+        return new Set(next);
+      });
     });
   }, []);
 
-  const beginFiling = useCallback(async (bookmarkId: string, suggestion?: BookmarkFolderSuggestion | null) => {
-    setBusy(bookmarkId);
+  const loadInboxSuggestions = useCallback(async () => {
+    return Promise.all(inbox.map(async (bookmark) => {
+      try {
+        const result = await request<{
+          bookmark: BookmarkRecord;
+          suggestion: BookmarkFolderSuggestion | null;
+        } | null>({ type: 'SUGGEST_BOOKMARK_FILE', bookmarkId: bookmark.id });
+        return {
+          bookmark: result?.bookmark ?? bookmark,
+          suggestion: result?.suggestion ?? null,
+        };
+      } catch {
+        return { bookmark, suggestion: null };
+      }
+    }));
+  }, [inbox, request]);
+
+  const openReviewSheet = useCallback(async (focusBookmarkId?: string) => {
+    if (!inbox.length) return;
+    setBusy('review');
     try {
-      const resolved = suggestion === undefined
-        ? await request<BookmarkFolderSuggestion | null>({ type: 'SUGGEST_BOOKMARK_FILE', bookmarkId })
-        : suggestion;
-      setFilingDraft({
-        bookmarkId,
-        suggestion: resolved,
-        folderId: resolved?.folderId ?? availableFolders[0]?.id ?? '',
-      });
+      setReviewSheet({ rows: await loadInboxSuggestions(), focusBookmarkId });
     } catch (error) {
       showToast({ id: `${Date.now()}`, tone: 'error', message: error instanceof Error ? error.message : t('actionFailed') });
     } finally {
       setBusy(null);
     }
-  }, [availableFolders, request, showToast, t]);
+  }, [inbox.length, loadInboxSuggestions, showToast, t]);
 
-  const fileBookmark = useCallback(async () => {
-    if (!filingDraft?.folderId) return;
-    setBusy(filingDraft.bookmarkId);
+  const refreshOrganizeSnapshots = useCallback(async () => {
     try {
-      const result = await request<{ moved: number }>({
-        type: 'FILE_BOOKMARKS',
-        bookmarkIds: [filingDraft.bookmarkId],
-        folderId: filingDraft.folderId,
+      const list = await request<BookmarkOrganizeSnapshotSummary[]>({ type: 'GET_BOOKMARK_ORGANIZE_SNAPSHOTS' });
+      setOrganizeSnapshots(Array.isArray(list) ? list : []);
+    } catch {
+      setOrganizeSnapshots([]);
+    }
+  }, [request]);
+
+  const refreshTopicReady = useCallback(async () => {
+    const status = await getBuiltInAiStatus();
+    setBuiltInAvailable(status === 'available');
+  }, []);
+
+  const revokeOrganizeAnalyze = useCallback(() => {
+    analyzeGen.current += 1;
+    setAnalyzing(false);
+    setTopicResult(null);
+  }, []);
+
+  const closeOrganize = useCallback(() => {
+    revokeOrganizeAnalyze();
+    setHealthOpen(false);
+  }, [revokeOrganizeAnalyze]);
+
+  const openOrganize = useCallback(() => {
+    revokeOrganizeAnalyze();
+    setHealthOpen((open) => {
+      if (open) return false;
+      void refreshOrganizeSnapshots();
+      void refreshTopicReady();
+      return true;
+    });
+  }, [refreshOrganizeSnapshots, refreshTopicReady, revokeOrganizeAnalyze]);
+
+  const applyFiling = useCallback(async (
+    plan: {
+      creates: Array<{ clientId: string; parentId: string; title: string }>;
+      moves: Array<{ bookmarkId: string; folderId: string }>;
+    },
+    rowCount = reviewSheet?.rows.length ?? 0,
+    toast: 'filed' | 'organized' = 'filed',
+  ) => {
+    setBusy('filing');
+    try {
+      const result = await request<{ moved: number; skipped: number }>({
+        type: 'APPLY_BOOKMARK_FILING',
+        creates: plan.creates,
+        moves: plan.moves,
       });
-      const folder = availableFolders.find((item) => item.id === filingDraft.folderId);
+      const userSkipped = Math.max(0, rowCount - plan.moves.length);
+      const skipped = userSkipped + result.skipped;
+      const firstFolderId = plan.moves[0]?.folderId;
+      const createdTitle = plan.creates.find((create) => create.clientId === firstFolderId)?.title;
+      const folderTitle = createdTitle
+        ?? availableFolders.find((folder) => folder.id === firstFolderId)?.title
+        ?? '';
+      const filed = toast === 'organized'
+        ? t('bookmarksOrganized', { count: result.moved })
+        : t('bookmarksFiled', { count: result.moved, folder: folderTitle });
       showToast({
         id: `${Date.now()}`,
         tone: result.moved > 0 ? 'success' : 'neutral',
-        message: t('bookmarksFiled', { count: result.moved, folder: folder?.title ?? '' }),
+        message: skipped > 0 ? `${filed} ${t('bookmarksSkipped', { count: skipped })}` : filed,
         ...(result.moved > 0 ? { action: 'undo' as const } : {}),
       });
-      setFilingDraft(null);
+      setReviewSheet(null);
+      closeOrganize();
       onDismissSuggestion();
     } catch (error) {
       showToast({ id: `${Date.now()}`, tone: 'error', message: error instanceof Error ? error.message : t('actionFailed') });
     } finally {
       setBusy(null);
     }
-  }, [availableFolders, filingDraft, onDismissSuggestion, request, showToast, t]);
+  }, [availableFolders, closeOrganize, onDismissSuggestion, request, reviewSheet?.rows.length, showToast, t]);
 
-  const previewDuplicates = useCallback(() => {
-    const groups = findBookmarkDuplicateGroups(bookmarks);
-    if (!groups.length) {
-      showToast({ id: `${Date.now()}`, tone: 'neutral', message: t('noDuplicateBookmarks') });
+  const applyOrganizeFiling = useCallback(async (customProposal?: BookmarkOrganizeProposal, scope?: BookmarkOrganizeScope) => {
+    const proposal = customProposal ?? topicResult?.proposal ?? proposeBookmarkOrganize({ bookmarks, folders, scope });
+    if (!proposal.moves.length) {
+      showToast({ id: `${Date.now()}`, tone: 'neutral', message: t('organizeNothingToApply') });
       return;
     }
-    setDuplicateGroups(groups);
-  }, [bookmarks, showToast, t]);
+    analyzeGen.current += 1;
+    setAnalyzing(false);
+    setBusy('organize');
+    try {
+      const result = await request<{ moved: number; skipped: number; snapshotSaved: boolean }>({
+        type: 'APPLY_BOOKMARK_ORGANIZE',
+        creates: proposal.creates,
+        moves: proposal.moves,
+        scope,
+      });
+      if (result.moved === 0) {
+        showToast({ id: `${Date.now()}`, tone: 'neutral', message: t('organizeNothingToApply') });
+        closeOrganize();
+        await refreshOrganizeSnapshots();
+        return;
+      }
+      const organized = t('bookmarksOrganized', { count: result.moved });
+      showToast({
+        id: `${Date.now()}`,
+        tone: result.snapshotSaved === false ? 'warning' : 'success',
+        message: result.snapshotSaved === false
+          ? t('organizeSnapshotSaveFailed')
+          : result.skipped > 0 ? `${organized} ${t('bookmarksSkipped', { count: result.skipped })}` : organized,
+        action: 'undo',
+      });
+      setTopicResult(null);
+      setHealthOpen(false);
+      await refreshOrganizeSnapshots();
+    } catch (error) {
+      showToast({ id: `${Date.now()}`, tone: 'error', message: error instanceof Error ? error.message : t('actionFailed') });
+    } finally {
+      setBusy(null);
+    }
+  }, [bookmarks, closeOrganize, folders, refreshOrganizeSnapshots, request, showToast, t, topicResult]);
+
+  const analyzeOrganizeTopic = useCallback(async (scope?: BookmarkOrganizeScope) => {
+    const generation = analyzeGen.current + 1;
+    analyzeGen.current = generation;
+    setTopicResult(null);
+    setAnalyzing(true);
+    try {
+      if (cloudReady) {
+        const result = await request<{
+          granted?: boolean;
+          proposal?: BookmarkOrganizeProposal;
+          source?: 'topic-model' | 'host-heuristic';
+          analyzedCount?: number;
+          eligibleCount?: number;
+        }>({ type: 'ANALYZE_BOOKMARK_ORGANIZE', scope });
+        if (analyzeGen.current !== generation) return;
+        if (result?.granted && result.source === 'topic-model' && result.proposal) {
+          setTopicResult({
+            proposal: result.proposal,
+            analyzedCount: result.analyzedCount ?? 0,
+            eligibleCount: result.eligibleCount ?? 0,
+          });
+          return;
+        }
+        if (result?.granted !== false && result?.source !== 'topic-model' && (result?.eligibleCount ?? 0) > 0) {
+          showToast({ id: `${Date.now()}`, tone: 'warning', message: t('organizeTopicFailed') });
+        }
+        return;
+      }
+      const status = await getBuiltInAiStatus();
+      if (analyzeGen.current !== generation) return;
+      if (status !== 'available') {
+        showToast({ id: `${Date.now()}`, tone: 'warning', message: t('organizeTopicFailed') });
+        return;
+      }
+      const { eligible, analyzed } = selectAnalyzeBookmarks(bookmarks, folders, scope);
+      const raw = await requestTopicOrganizeJson(
+        buildTopicAnalyzePayload(analyzed, folders, settings.language, scope),
+        'local-model',
+        settings,
+        '',
+      );
+      if (analyzeGen.current !== generation) return;
+      const topic = topicProposalFromModel(raw, bookmarks, folders, scope);
+      if (!topic.clusters.length) {
+        showToast({ id: `${Date.now()}`, tone: 'warning', message: t('organizeTopicFailed') });
+        return;
+      }
+      setTopicResult({
+        proposal: mergeTopicWithHostOrganize(topic, bookmarks, folders, scope),
+        analyzedCount: analyzed.length,
+        eligibleCount: eligible.length,
+      });
+    } catch {
+      if (analyzeGen.current !== generation) return;
+      showToast({ id: `${Date.now()}`, tone: 'warning', message: t('organizeTopicFailed') });
+    } finally {
+      if (analyzeGen.current === generation) setAnalyzing(false);
+    }
+  }, [bookmarks, cloudReady, folders, request, settings, showToast, t]);
+
+  const restoreOrganizeSnapshot = useCallback(async (snapshotId: string) => {
+    const snapshot = organizeSnapshots.find((item) => item.id === snapshotId);
+    if (!snapshot) return;
+    const time = formatOrganizeSnapshotTime(snapshot.createdAt, settings.language);
+    if (!window.confirm(t('organizeRestoreConfirm', { time }))) return;
+    revokeOrganizeAnalyze();
+    setBusy('restore');
+    try {
+      const result = await request<{ moved: number; skipped: number }>({
+        type: 'RESTORE_BOOKMARK_ORGANIZE',
+        snapshotId,
+      });
+      const restored = t('organizeRestored', { count: result.moved });
+      showToast({
+        id: `${Date.now()}`,
+        tone: result.moved > 0 ? 'success' : 'neutral',
+        message: result.skipped > 0 ? `${restored} ${t('bookmarksSkipped', { count: result.skipped })}` : restored,
+      });
+      await refreshOrganizeSnapshots();
+    } catch (error) {
+      showToast({ id: `${Date.now()}`, tone: 'error', message: error instanceof Error ? error.message : t('actionFailed') });
+    } finally {
+      setBusy(null);
+    }
+  }, [organizeSnapshots, refreshOrganizeSnapshots, request, revokeOrganizeAnalyze, settings.language, showToast, t]);
 
   const applyDedup = useCallback(async () => {
-    if (!duplicateGroups) return;
+    if (!healthGroups.length) return;
     setBusy('dedup');
     try {
-      const result = await request<{ removed: number }>({ type: 'APPLY_BOOKMARK_DEDUP', groups: duplicateGroups });
+      const result = await request<{ removed: number }>({ type: 'APPLY_BOOKMARK_DEDUP', groups: healthGroups });
       showToast({
         id: `${Date.now()}`,
         tone: result.removed > 0 ? 'success' : 'neutral',
         message: t('duplicateBookmarksRemoved', { count: result.removed }),
         ...(result.removed > 0 ? { action: 'undo' as const } : {}),
       });
-      setDuplicateGroups(null);
+      setHealthOpen(false);
+      revokeOrganizeAnalyze();
     } catch (error) {
       showToast({ id: `${Date.now()}`, tone: 'error', message: error instanceof Error ? error.message : t('actionFailed') });
     } finally {
       setBusy(null);
     }
-  }, [duplicateGroups, request, showToast, t]);
+  }, [healthGroups, request, revokeOrganizeAnalyze, showToast, t]);
+
+  const reviewInboxFromHealth = useCallback(() => {
+    closeOrganize();
+    void openReviewSheet();
+  }, [closeOrganize, openReviewSheet]);
+
+  useEffect(() => {
+    if (permissionGranted === false) {
+      revokeOrganizeAnalyze();
+      setHealthOpen(false);
+    }
+  }, [permissionGranted, revokeOrganizeAnalyze]);
+
+  useEffect(() => () => { analyzeGen.current += 1; }, []);
+
+  useEffect(() => {
+    if (!healthOpen) return;
+    void refreshTopicReady();
+  }, [healthOpen, hasCloudApiKey, refreshTopicReady, settings.aiProvider]);
+
+  useEffect(() => {
+    if (!onChromeChange) return;
+    if (permissionGranted !== true) {
+      onChromeChange(null);
+      return;
+    }
+    onChromeChange({
+      inboxCount: inbox.length,
+      openOrganize,
+      openExport: () => setExportOpen(true),
+      openReview: () => { void openReviewSheet(); },
+    });
+    return () => onChromeChange(null);
+  }, [inbox.length, onChromeChange, openOrganize, openReviewSheet, permissionGranted]);
+
+  const runBookmarkAction = useCallback(async (message: ZenTabMessage) => {
+    try {
+      await request(message);
+      const undoKey = bookmarkUndoToastKey(message.type);
+      if (undoKey) showToast({ id: `${Date.now()}`, tone: 'success', message: t(undoKey), action: 'undo' });
+    } catch (error) {
+      showToast({ id: `${Date.now()}`, tone: 'error', message: error instanceof Error ? error.message : t('actionFailed') });
+    }
+  }, [request, showToast, t]);
+
+  const openBookmarkUrls = useCallback(async (urls: string[]) => {
+    if (!urls.length) return;
+    if (urls.length > 15 && !window.confirm(t('openAllBookmarksConfirm', { count: urls.length }))) return;
+    await runBookmarkAction({ type: 'OPEN_BOOKMARK_URLS', urls });
+  }, [runBookmarkAction, t]);
+
+  const createFolderUnder = useCallback((parentId: string | undefined) => {
+    if (!parentId) return;
+    setEditDraft({ kind: 'create-folder', parentId, title: '' });
+  }, []);
+
+  const saveEdit = useCallback(async (value: { title: string; url?: string }) => {
+    if (!editDraft) return;
+    const title = value.title.trim();
+    if (!title) return;
+    if (editDraft.kind === 'create-folder') {
+      await runBookmarkAction({ type: 'CREATE_BOOKMARK_FOLDER', parentId: editDraft.parentId, title });
+      setEditDraft(null);
+      return;
+    }
+    await runBookmarkAction({
+      type: 'UPDATE_BOOKMARK',
+      id: editDraft.id,
+      title,
+      ...(value.url !== undefined ? { url: value.url } : {}),
+    });
+    setEditDraft(null);
+  }, [editDraft, runBookmarkAction]);
+
+  const siblings = useMemo(() => [
+    ...folders.map((folder) => ({ id: folder.id, index: folder.index, parentId: folder.parentId ?? '' })),
+    ...bookmarks.map((bookmark) => ({ id: bookmark.id, index: bookmark.index, parentId: bookmark.parentId })),
+  ], [bookmarks, folders]);
+  const visibleRowsRef = useRef(visibleRows);
+  visibleRowsRef.current = visibleRows;
+  const foldersRef = useRef(folders);
+  foldersRef.current = folders;
+  const otherRootIdRef = useRef(otherRootId);
+  otherRootIdRef.current = otherRootId;
+  const siblingsRef = useRef(siblings);
+  siblingsRef.current = siblings;
+  const collapsedFoldersRef = useRef(collapsedFolders);
+  collapsedFoldersRef.current = collapsedFolders;
+  const hitRef = useRef<{ over: BookmarkDragOver | null; placement?: 'before' | 'after' }>({ over: null });
+  const lastHitRef = useRef<{ over: BookmarkDragOver; placement?: 'before' | 'after' } | null>(null);
+
+  const springTimerRef = useRef<{ folderId: string; timer: number } | null>(null);
+  const clearSpringTimer = () => {
+    if (springTimerRef.current) {
+      window.clearTimeout(springTimerRef.current.timer);
+      springTimerRef.current = null;
+    }
+  };
+
+  const { overlay, source: draggingId, onPointerDown: onBookmarkPointerDown, consumeSuppressedClick } = usePointerDragSession<string>({
+    enabled: sortableEnabled,
+    scrollerRef: scrollRef,
+    onActivate: (sourceId) => {
+      clearSpringTimer();
+      lastHitRef.current = null;
+      hitRef.current = { over: null };
+      setVisualRows(placeBookmarkPlaceholder(visibleRowsRef.current, sourceId, { type: 'origin' }));
+    },
+    onDrag: (sourceId, point) => {
+      const scroller = scrollRef.current;
+      const scrollerRect = scroller?.getBoundingClientRect();
+      const localX = scrollerRect ? point.x - scrollerRect.left : undefined;
+      const raw = readBookmarkDragOver(
+        point.x,
+        point.y,
+        foldersRef.current,
+        sourceId,
+        collapsedFoldersRef.current,
+        localX,
+      );
+      const lastRowBottom = scroller
+        ? [...scroller.querySelectorAll('[data-bookmark-drop]')].reduce((bottom, node) => Math.max(bottom, node.getBoundingClientRect().bottom), 0) || null
+        : null;
+      const source = parseBookmarkDragSource(sourceId);
+      const lastVisibleTarget = findLastVisibleDropTarget(visibleRowsRef.current, sourceId, source?.type);
+      const measured = coerceBookmarkDragHit(raw, {
+        draggedKey: sourceId,
+        clientY: point.y,
+        lastRowBottom,
+        scrollerTop: scrollerRect?.top ?? 0,
+        scrollerBottom: scrollerRect?.bottom ?? 0,
+        lastVisibleTarget,
+      });
+      const inList = Boolean(scrollerRect && point.y >= scrollerRect.top && point.y <= scrollerRect.bottom);
+      const hit = rememberTabDragHit(lastHitRef.current, measured, inList);
+      lastHitRef.current = hit;
+      hitRef.current = { over: hit?.over ?? null, placement: hit?.placement };
+      setVisualRows(placeBookmarkPlaceholder(visibleRowsRef.current, sourceId, bookmarkPlaceholderDest(sourceId, hit)));
+      setTabDragOverId(hit?.over && (
+        hit.over.kind === 'bookmark-inbox'
+        || hit.over.kind === 'bookmark-folder'
+      ) ? formatTabDragId(hit.over) : null);
+
+      const hoveredFolderId = hit?.over && hit.over.kind === 'bookmark-folder' ? hit.over.folderId : null;
+      if (source?.type !== 'folder' && hoveredFolderId && collapsedFoldersRef.current.has(hoveredFolderId)) {
+        if (springTimerRef.current?.folderId !== hoveredFolderId) {
+          clearSpringTimer();
+          springTimerRef.current = {
+            folderId: hoveredFolderId,
+            timer: window.setTimeout(() => {
+              setCollapsedFolders((current) => {
+                if (!current.has(hoveredFolderId)) return current;
+                const next = new Set(current);
+                next.delete(hoveredFolderId);
+                void chrome.storage.local.set({ [COLLAPSED_BOOKMARK_FOLDERS_KEY]: Array.from(next) });
+                return next;
+              });
+            }, 500),
+          };
+        }
+      } else {
+        clearSpringTimer();
+      }
+    },
+    onFinish: (sourceId, canceled) => {
+      clearSpringTimer();
+      const hit = hitRef.current;
+      hitRef.current = { over: null };
+      lastHitRef.current = null;
+      setTabDragOverId(null);
+      if (canceled) {
+        setVisualRows(null);
+        return;
+      }
+      const source = parseBookmarkDragSource(sourceId);
+      if (!source) {
+        setVisualRows(null);
+        return;
+      }
+      const result = resolveBookmarkDragEnd({
+        source,
+        over: hit.over,
+        placement: hit.placement,
+        otherBookmarksRootId: otherRootIdRef.current,
+        folders: foldersRef.current,
+        siblings: siblingsRef.current,
+      });
+      if (result.type !== 'move') {
+        setVisualRows(null);
+        return;
+      }
+      setVisualRows((current) => current
+        ? settleBookmarkPlaceholder(current, visibleRowsRef.current, sourceId)
+        : null);
+
+      if (collapsedFolders.has(result.parentId)) {
+        setCollapsedFolders((current) => {
+          const next = new Set(current);
+          next.delete(result.parentId);
+          void chrome.storage.local.set({ [COLLAPSED_BOOKMARK_FOLDERS_KEY]: Array.from(next) });
+          return next;
+        });
+      }
+
+      const sourceSibling = siblingsRef.current.find((sibling) => sibling.id === result.id);
+      const isSameParent = sourceSibling?.parentId === result.parentId;
+
+      if (isSameParent) {
+        void request({
+          type: 'MOVE_BOOKMARK',
+          id: result.id,
+          parentId: result.parentId,
+          ...(result.index !== undefined ? { index: result.index } : {}),
+        }).catch((error) => {
+          showToast({ id: `${Date.now()}`, tone: 'error', message: error instanceof Error ? error.message : t('actionFailed') });
+        });
+      } else {
+        void runBookmarkAction({
+          type: 'MOVE_BOOKMARK',
+          id: result.id,
+          parentId: result.parentId,
+          ...(result.index !== undefined ? { index: result.index } : {}),
+        });
+      }
+    },
+  });
+
+  const draggingRef = useRef(false);
+  draggingRef.current = draggingId != null;
+  useEffect(() => {
+    if (draggingRef.current) return;
+    setVisualRows(null);
+  }, [visibleRows]);
 
   const enrichBookmark = useCallback(async (bookmark: BookmarkRecord) => {
     const canonical = canonicalizeUrl(bookmark.url);
@@ -292,27 +1005,6 @@ export function BookmarkList({
     }
   }, [bookmarks, canEnrich, onBookmarksChange, openTabs, showToast, t]);
 
-  const handleTabDragOver = (event: React.DragEvent, target: string) => {
-    if (!event.dataTransfer.types.includes('text/tab-id')) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = 'move';
-    setDropTarget(target);
-  };
-
-  const handleTabDragLeave = (event: React.DragEvent, target: string) => {
-    const next = event.relatedTarget;
-    if (next instanceof Node && event.currentTarget.contains(next)) return;
-    setDropTarget((current) => current === target ? null : current);
-  };
-
-  const handleTabDrop = (event: React.DragEvent, folderId?: string) => {
-    event.preventDefault();
-    event.stopPropagation();
-    setDropTarget(null);
-    const tabId = Number(event.dataTransfer.getData('text/tab-id'));
-    if (Number.isFinite(tabId)) void fileDroppedTab(tabId, folderId, { openTabs, request, showToast, t });
-  };
-
   if (loading && permissionGranted == null) {
     return <div className="bookmark-loading" role="status"><RefreshCw size={16} className="spin" /> {t('loadingBookmarks')}</div>;
   }
@@ -326,66 +1018,184 @@ export function BookmarkList({
     </div>;
   }
 
-  const openCanonicalUrls = new Set(openTabs.map((tab) => canonicalizeUrl(tab.url)).filter(Boolean));
-  const searching = Boolean(search.trim());
+  const iconsForUrls = (urls: string[]) => pickFaviconStack(urls.map((url) => resolveBookmarkFavicon(
+    url,
+    openTabs,
+    faviconGranted ? chromeFaviconUrl(url, (path) => chrome.runtime.getURL(path)) : undefined,
+  )));
 
-  const renderBookmarkRow = (bookmark: BookmarkRecord) => {
-    const inTray = inboxIds.has(bookmark.id);
-    const hasOpenTab = openCanonicalUrls.has(canonicalizeUrl(bookmark.url));
+  const rowActions = (bookmark: BookmarkRecord, inTray: boolean): ContextMenuItem[] => buildBookmarkRowContextSpecs({
+    t,
+    isInbox: inTray,
+    canMutate: canMutateRecord(bookmark, folders),
+  }).map((spec) => ({
+    ...spec,
+    icon: spec.id === 'open' ? <Globe2 size={14} /> : spec.id === 'file' ? <Bookmark size={14} /> : spec.id === 'edit' ? <Pencil size={14} /> : spec.id === 'delete' ? <Trash2 size={14} /> : undefined,
+    onSelect: () => {
+      if (spec.id === 'open') void openBookmarkUrls([bookmark.url]);
+      if (spec.id === 'file') void openReviewSheet(bookmark.id);
+      if (spec.id === 'edit') setEditDraft({ kind: 'bookmark', id: bookmark.id, title: bookmark.title, url: bookmark.url });
+      if (spec.id === 'delete') void runBookmarkAction({ type: 'REMOVE_BOOKMARK', id: bookmark.id });
+    },
+  }));
+
+  const folderActions = (folder: BookmarkFolderRecord, collapsed: boolean): ContextMenuItem[] => {
+    const children = folderChildren.get(folder.id) ?? [];
+    return buildBookmarkGroupContextSpecs({
+      t,
+      collapsed,
+      canMutate: canMutateRecord(folder, folders),
+      isSpecialRoot: folder.isSpecialRoot,
+    }).map((spec) => ({
+      ...spec,
+      icon: spec.id === 'new-folder' ? <FolderPlus size={14} /> : spec.id === 'rename' ? <Pencil size={14} /> : spec.id === 'delete' ? <Trash2 size={14} /> : spec.id === 'open-all' ? <Globe2 size={14} /> : undefined,
+      onSelect: () => {
+        if (spec.id === 'expand' || spec.id === 'collapse') toggleFolder(folder.id);
+        if (spec.id === 'open-all') void openBookmarkUrls(collectFolderUrls(children));
+        if (spec.id === 'new-folder') void createFolderUnder(folder.id);
+        if (spec.id === 'rename') setEditDraft({ kind: 'folder', id: folder.id, title: folder.title });
+        if (spec.id === 'delete' && window.confirm(t('deleteFolderConfirm'))) {
+          void runBookmarkAction({ type: 'REMOVE_BOOKMARK_FOLDER', id: folder.id });
+        }
+      },
+    }));
+  };
+
+  const inboxActions = (): ContextMenuItem[] => [
+    {
+      id: collapsedFolders.has(INBOX_COLLAPSE_ID) ? 'expand' : 'collapse',
+      label: collapsedFolders.has(INBOX_COLLAPSE_ID) ? t('expandFolder') : t('collapseFolder'),
+      onSelect: () => toggleFolder(INBOX_COLLAPSE_ID),
+    },
+    { id: 'open-all', label: t('openAllBookmarks'), icon: <Globe2 size={14} />, onSelect: () => { void openBookmarkUrls(inbox.map((bookmark) => bookmark.url)); } },
+    { id: 'review', label: t('reviewInbox'), icon: <Bookmark size={14} />, onSelect: () => { void openReviewSheet(); } },
+    ...(otherRootId ? [{ id: 'new-folder', label: t('newBookmarkFolder'), icon: <FolderPlus size={14} />, onSelect: () => { void createFolderUnder(otherRootId); } }] : []),
+  ];
+
+  const renderBookmarkRow = (bookmark: BookmarkRecord, inTray: boolean) => {
+    const canonical = canonicalizeUrl(bookmark.url);
+    const hasOpenTab = Boolean(canonical && openCanonicalUrls.has(canonical));
     const icon = resolveBookmarkFavicon(
       bookmark.url,
       openTabs,
       faviconGranted ? chromeFaviconUrl(bookmark.url, (path) => chrome.runtime.getURL(path)) : undefined,
     );
-    return <div className="bookmark-row" key={bookmark.id} onContextMenu={(event) => openContextMenu(event, buildBookmarkRowContextSpecs({ t, isInbox: inTray }).map((spec) => ({
-      ...spec,
-      onSelect: () => {
-        if (spec.id === 'open') void chrome.tabs.create({ url: bookmark.url });
-        if (spec.id === 'file') void beginFiling(bookmark.id);
-      },
-    })), bookmark.title || bookmark.url)}>
-      <button className="bookmark-main" onClick={() => void chrome.tabs.create({ url: bookmark.url })}>
-        <span className="bookmark-icon">{icon ? <img src={icon} alt="" className="favicon" /> : <Globe2 size={14} />}</span>
-        <span className="bookmark-copy">
-          <strong>{bookmark.title || bookmark.url}</strong>
-          <small>{hostLabel(bookmark.url)}{bookmark.summary ? ` · ${bookmark.summary}` : ''}</small>
-        </span>
-      </button>
-      {canEnrich && hasOpenTab && <button className="bookmark-row-action" disabled={busy === bookmark.id} onClick={() => void enrichBookmark(bookmark)} title={t('enrichBookmark')} aria-label={t('enrichBookmark')}><Sparkles size={13} /></button>}
-      {inTray && <button className="small-button bookmark-file" disabled={busy === bookmark.id} onClick={() => void beginFiling(bookmark.id)}>{t('fileBookmark')}</button>}
-    </div>;
+    const rowId = formatBookmarkRowId(bookmark.id);
+    const items = [
+      ...rowActions(bookmark, inTray),
+      ...(canEnrich && hasOpenTab ? [{
+        id: 'enrich',
+        label: t('enrichBookmark'),
+        icon: <Sparkles size={14} />,
+        onSelect: () => { void enrichBookmark(bookmark); },
+        disabled: busy === bookmark.id,
+      }] : []),
+    ];
+    return <BookmarkCard
+      bookmark={bookmark}
+      host={hostLabel(bookmark.url)}
+      icon={icon}
+      dragging={draggingId === rowId}
+      canDrag={sortableEnabled && canMutateRecord(bookmark, folders)}
+      items={items}
+      t={t}
+      overflowCloseToken={overflowCloseToken}
+      onOpenOverflow={onOpenOverflow}
+      onPointerDown={(event) => onBookmarkPointerDown(rowId, event)}
+      onOpen={() => { if (!consumeSuppressedClick()) void openBookmarkUrls([bookmark.url]); }}
+      onContextMenu={(event) => openContextMenu(event, items, bookmark.title || bookmark.url)}
+    />;
   };
 
-  const renderForest = (nodes: BookmarkForestNode[]): React.ReactNode => nodes.map((node) => {
-    if (node.kind === 'bookmark') return renderBookmarkRow(node.bookmark);
-    const collapsed = collapsedFolders.has(node.folder.id);
-    return <section className="bookmark-group" key={node.folder.id}>
-      <header
-        className={dropTarget === node.folder.id ? 'drop-target' : undefined}
-        aria-expanded={!collapsed}
-        onClick={() => toggleFolder(node.folder.id)}
-        onContextMenu={(event) => openContextMenu(event, buildBookmarkGroupContextSpecs({ t, collapsed }).map((spec) => ({
-          ...spec,
-          onSelect: () => toggleFolder(node.folder.id),
-        })), node.folder.title)}
-        onDragOver={(event) => handleTabDragOver(event, node.folder.id)}
-        onDragLeave={(event) => handleTabDragLeave(event, node.folder.id)}
-        onDrop={(event) => handleTabDrop(event, node.folder.id)}
+  const renderFolderRow = (folder: BookmarkFolderRecord, count: number, collapsed: boolean, sticky = false) => {
+    const children = folderChildren.get(folder.id) ?? [];
+    const surface = folderSurfaceColor(folder.id);
+    const folderRowId = formatBookmarkFolderRowId(folder.id);
+    const items = folderActions(folder, collapsed);
+    return <BookmarkGroupRow
+      name={folder.title}
+      count={count}
+      collapsed={collapsed}
+      icons={iconsForUrls(collectFolderUrls(children, 8))}
+      surface={surface}
+      rail
+      droppable={{ kind: 'bookmark-folder', folderId: folder.id }}
+      dropId={sticky ? undefined : folderRowId}
+      parentId={sticky ? undefined : folder.parentId ?? ''}
+      index={sticky ? undefined : folder.index}
+      dragging={!sticky && draggingId === folderRowId}
+      canDrag={sortableEnabled && !sticky && canMutateRecord(folder, folders)}
+      items={items}
+      t={t}
+      overflowCloseToken={overflowCloseToken}
+      onOpenOverflow={onOpenOverflow}
+      onToggle={() => { if (!consumeSuppressedClick()) toggleFolder(folder.id); }}
+      onPointerDown={sticky ? undefined : (event) => onBookmarkPointerDown(folderRowId, event)}
+      onContextMenu={(event) => openContextMenu(event, items, folder.title)}
+    />;
+  };
+
+  const renderInboxHeader = (count: number, collapsed: boolean, _sticky = false) => (
+    <BookmarkGroupRow
+      name={t('bookmarkInbox')}
+      count={count}
+      collapsed={collapsed}
+      icons={iconsForUrls(inbox.map((bookmark) => bookmark.url))}
+      surface={INBOX_SURFACE_COLOR}
+      droppable={{ kind: 'bookmark-inbox' }}
+      items={inboxActions()}
+      t={t}
+      hint={t('bookmarkInboxHint')}
+      overflowCloseToken={overflowCloseToken}
+      onOpenOverflow={onOpenOverflow}
+      onToggle={() => toggleFolder(INBOX_COLLAPSE_ID)}
+      onContextMenu={(event) => openContextMenu(event, inboxActions(), t('bookmarkInbox'))}
+    />
+  );
+
+  const showEmpty = !loading && visibleRows.length === 0;
+  const virtualItems = virtualizer.getVirtualItems();
+  const scrollOffset = virtualizer.scrollOffset ?? 0;
+  const firstVisibleIndex = firstViewportIndex(virtualItems, scrollOffset);
+  const stickyCandidate = resolveStickyGroup(displayRows, firstVisibleIndex, BOOKMARK_STICKY_KINDS);
+  const stickyItem = stickyCandidate
+    ? virtualItems.find((item) => item.index === displayRows.indexOf(stickyCandidate))
+    : undefined;
+  const stickyRow = stickyCandidate
+    && (!stickyItem || stickyHeaderHasScrolledAway(stickyItem.start, stickyItem.size, scrollOffset))
+    ? stickyCandidate
+    : null;
+
+  const renderRow = (row: BookmarkDisplayRow, sticky = false) => {
+    if (row.kind === 'placeholder') return <div className="tab-drop-placeholder" aria-hidden="true" />;
+    if (row.kind === 'empty-slot') {
+      return <div
+        className="bookmark-empty-slot"
+        data-bookmark-drop={`bookmark-empty-slot-${row.folderId}`}
+        data-bookmark-parent={row.folderId}
+        data-bookmark-index={0}
       >
-        <span className="bookmark-chevron">{collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}</span>
-        <strong>{dropTarget === node.folder.id ? t('dropToFile') : node.folder.title}</strong>
-        <span>{node.count}</span>
-      </header>
-      {!collapsed && <div className="bookmark-folder-children">{renderForest(node.children)}</div>}
-    </section>;
-  });
+        <span>{t('emptyFolderDropHint')}</span>
+      </div>;
+    }
+    if (row.kind === 'inbox') return renderInboxHeader(row.count, row.collapsed, sticky);
+    if (row.kind === 'search') {
+      return <BookmarkGroupRow
+        name={t('bookmarkSearchResults')}
+        count={row.count}
+        collapsed={false}
+        icons={[]}
+        items={[]}
+        t={t}
+        overflowCloseToken={overflowCloseToken}
+        onOpenOverflow={onOpenOverflow}
+      />;
+    }
+    if (row.kind === 'folder') return renderFolderRow(row.folder, row.count, row.collapsed, sticky);
+    return renderBookmarkRow(row.bookmark, row.inbox);
+  };
 
   return <div className="bookmark-view">
-    <div className="bookmark-toolbar">
-      <span>{t('bookmarkLibraryDescription', { count: bookmarks.length })}</span>
-      <button className="small-button" disabled={busy === 'dedup'} onClick={previewDuplicates}><Trash2 size={12} /> {t('findDuplicates')}</button>
-    </div>
-
     {filingSuggestion && <div className="bookmark-suggestion">
       <Sparkles size={15} />
       <div>
@@ -394,83 +1204,391 @@ export function BookmarkList({
           ? t('bookmarkSuggestedFolder', { folder: filingSuggestion.suggestion.folderTitle })
           : t('bookmarkChooseFolder')}</span>
       </div>
-      <button className="small-button" onClick={() => void beginFiling(filingSuggestion.bookmarkId, filingSuggestion.suggestion)}>{t('review')}</button>
+      <button className="small-button" disabled={busy === 'review'} onClick={() => void openReviewSheet(filingSuggestion.bookmarkId)}>{t('review')}</button>
       <button className="icon-button subtle" onClick={onDismissSuggestion} aria-label={t('dismiss')}><X size={13} /></button>
     </div>}
 
-    <div className="bookmark-scroller">
-      {searching ? <>
-        {!loading && searchHits.length === 0 && <div className="empty-state bookmark-empty">
-          <div className="empty-orbit"><Bookmark size={20} /></div>
-          <strong>{t('noMatchingBookmarks')}</strong>
-          <p>{t('tryDifferentBookmarkSearch')}</p>
-        </div>}
-        {searchHits.length > 0 && <section className="bookmark-group">
-          <header><strong>{t('bookmarkSearchResults')}</strong><span>{searchHits.length}</span></header>
-          {searchHits.map(renderBookmarkRow)}
-        </section>}
-      </> : <>
-        <section
-          className={`bookmark-group bookmark-inbox${dropTarget === 'inbox' ? ' drop-target' : ''}`}
-          onDragOver={(event) => handleTabDragOver(event, 'inbox')}
-          onDragLeave={(event) => handleTabDragLeave(event, 'inbox')}
-          onDrop={(event) => handleTabDrop(event)}
-        >
-          <header>
-            <strong>{dropTarget === 'inbox' ? t('dropToFile') : t('bookmarkInbox')}</strong>
-            <span>{inbox.length}</span>
-          </header>
-          {inbox.map(renderBookmarkRow)}
-        </section>
-        {renderForest(forest)}
-        {!loading && inbox.length === 0 && forest.length === 0 && <div className="empty-state bookmark-empty">
-          <div className="empty-orbit"><Bookmark size={20} /></div>
-          <strong>{t('noBookmarksYet')}</strong>
-          <p>{t('saveBookmarkToAppear')}</p>
-        </div>}
-      </>}
-    </div>
-
-    {filingDraft && <div className="bookmark-inline-panel" role="dialog" aria-label={t('fileBookmark')}>
-      <div>
-        <strong>{t('chooseBookmarkFolder')}</strong>
-        {filingDraft.suggestion && <small>{filingDraft.suggestion.reason}</small>}
-      </div>
-      <select value={filingDraft.folderId} onChange={(event) => setFilingDraft({ ...filingDraft, folderId: event.target.value })}>
-        {!availableFolders.length && <option value="">{t('noBookmarkFolders')}</option>}
-        {availableFolders.map((folder) => <option key={folder.id} value={folder.id}>{folder.folderPath}</option>)}
-      </select>
-      <button className="primary-button" disabled={!filingDraft.folderId || busy === filingDraft.bookmarkId} onClick={() => void fileBookmark()}>{t('fileBookmark')}</button>
-      <button className="icon-button subtle" onClick={() => setFilingDraft(null)} aria-label={t('cancel')}><X size={13} /></button>
-    </div>}
-
-    <ContextMenu open={Boolean(contextMenu)} x={contextMenu?.x ?? 0} y={contextMenu?.y ?? 0} items={contextMenu?.items ?? []} label={contextMenu?.label ?? t('bookmarks')} onClose={() => setContextMenu(null)} />
-
-    {duplicateGroups && <div className="modal-backdrop" role="presentation">
-      <div className="modal-sheet bookmark-dedup-modal" role="dialog" aria-modal="true" aria-label={t('bookmarkDedupTitle')}>
-        <header className="modal-header">
-          <div><span className="eyebrow">{t('bookmarkDedupEyebrow')}</span><h2>{t('bookmarkDedupTitle')}</h2><p>{t('bookmarkDedupDescription')}</p></div>
-          <button className="icon-button" onClick={() => setDuplicateGroups(null)} aria-label={t('close')}><X size={15} /></button>
-        </header>
-        <div className="modal-content bookmark-dedup-list">
-          {duplicateGroups.map((group) => {
-            const keep = bookmarks.find((item) => item.id === group.keepId);
-            const remove = group.removeIds
-              .map((id) => bookmarks.find((item) => item.id === id))
-              .filter((item): item is BookmarkRecord => Boolean(item));
-            return <div className="bookmark-dedup-group" key={group.canonicalUrl}>
-              <strong>{keep?.title || group.canonicalUrl}</strong>
-              <small>{t('bookmarkDedupKeep', { folder: keep?.folderPath ?? '' })}</small>
-              <span>{t('bookmarkDedupRemove', { count: group.removeIds.length })}</span>
-              {remove.map((bookmark) => <span className="bookmark-dedup-remove" key={bookmark.id}>× {bookmark.folderPath}</span>)}
+    <div className={draggingId ? 'tree-scroller is-dragging bookmark-tree' : 'tree-scroller bookmark-tree'} ref={scrollRef}>
+      {showEmpty ? <div className="empty-state bookmark-empty">
+        <div className="empty-orbit"><Bookmark size={20} /></div>
+        <strong>{searching ? t('noMatchingBookmarks') : t('noBookmarksYet')}</strong>
+        <p>{searching ? t('tryDifferentBookmarkSearch') : t('saveBookmarkToAppear')}</p>
+      </div> : <>
+        {stickyRow && stickyRow.kind !== 'bookmark' && stickyRow.kind !== 'placeholder' && stickyRow.kind !== 'empty-slot' && <div className="sticky-group-header">{renderRow(stickyRow, true)}</div>}
+        <div className={draggingId ? 'tree-canvas is-sorting' : 'tree-canvas'} style={{ height: virtualizer.getTotalSize() }}>
+          {virtualItems.map((virtualRow) => {
+            const row = displayRows[virtualRow.index];
+            if (!row) return null;
+            const rowKey = row.kind === 'bookmark'
+              ? `bookmark-${row.bookmark.id}`
+              : row.kind === 'folder'
+                ? `folder-${row.folder.id}`
+                : row.kind === 'empty-slot'
+                  ? `empty-slot-${row.folderId}`
+                  : row.kind;
+            const depth = row.kind === 'folder' || row.kind === 'bookmark' || row.kind === 'placeholder' || row.kind === 'empty-slot' ? row.depth : 0;
+            return <div
+              key={rowKey}
+              ref={virtualizer.measureElement}
+              data-index={virtualRow.index}
+              className="tree-position"
+              style={{ top: virtualRow.start, '--bookmark-depth': depth } as React.CSSProperties}
+            >
+              {renderRow(row)}
             </div>;
           })}
         </div>
-        <footer className="modal-footer modal-actions">
-          <button className="text-button" onClick={() => setDuplicateGroups(null)}>{t('cancel')}</button>
-          <button className="primary-button danger-button" disabled={busy === 'dedup'} onClick={() => void applyDedup()}>{t('removeDuplicateBookmarks', { count: duplicateGroups.reduce((sum, group) => sum + group.removeIds.length, 0) })}</button>
-        </footer>
-      </div>
-    </div>}
+        {draggingId && <div className="tree-list-end" aria-hidden="true" />}
+      </>}
+    </div>
+
+    {reviewSheet && <BookmarkFilingSheet
+      rows={reviewSheet.rows}
+      folders={folders}
+      t={t}
+      busy={busy === 'filing'}
+      focusBookmarkId={reviewSheet.focusBookmarkId}
+      onClose={() => setReviewSheet(null)}
+      onApply={(plan) => { void applyFiling(plan); }}
+    />}
+
+    {healthOpen && <BookmarkHealthSheet
+      bookmarks={bookmarks}
+      folders={folders}
+      inboxCount={inbox.length}
+      groups={healthGroups}
+      t={t}
+      busy={busy === 'dedup' || busy === 'organize' || busy === 'restore' || busy === 'review'}
+      topicReady={topicReady}
+      analyzing={analyzing}
+      topicResult={topicResult}
+      snapshots={organizeSnapshots}
+      language={settings.language}
+      faviconGranted={faviconGranted}
+      openTabs={openTabs}
+      onClose={closeOrganize}
+      onApplyDedup={() => { void applyDedup(); }}
+      onApplyOrganize={(plan, scope) => { void applyOrganizeFiling(plan, scope); }}
+      onReviewInbox={reviewInboxFromHealth}
+      onAnalyzeTopic={(scope) => { void analyzeOrganizeTopic(scope); }}
+      onClearTopic={() => setTopicResult(null)}
+      onRestoreSnapshot={(snapshotId) => { void restoreOrganizeSnapshot(snapshotId); }}
+    />}
+
+    {exportOpen && <BookmarkExportSheet
+      folders={folders}
+      bookmarks={bookmarks}
+      t={t}
+      onClose={() => setExportOpen(false)}
+    />}
+
+    {editDraft && <BookmarkEditPanel
+      label={editDraft.kind === 'create-folder' ? t('newBookmarkFolder') : t('editBookmark')}
+      titleLabel={editDraft.kind === 'create-folder' ? t('bookmarkFolderName') : undefined}
+      title={editDraft.title}
+      url={editDraft.kind === 'bookmark' ? editDraft.url : undefined}
+      onTitleChange={(title) => setEditDraft({ ...editDraft, title })}
+      onUrlChange={editDraft.kind === 'bookmark' ? (url) => setEditDraft({ ...editDraft, url }) : undefined}
+      onSave={(value) => { void saveEdit(value); }}
+      onClose={() => setEditDraft(null)}
+      showToast={showToast}
+      t={t}
+    />}
+
+    <ContextMenu open={Boolean(contextMenu)} x={contextMenu?.x ?? 0} y={contextMenu?.y ?? 0} items={contextMenu?.items ?? []} label={contextMenu?.label ?? t('bookmarks')} onClose={() => setContextMenu(null)} />
+    {overlay && draggingId && <DragPreviewOverlay
+      x={overlay.x}
+      y={overlay.y}
+      icon={dragPreviewIcon(draggingId, bookmarks, folders, openTabs, faviconGranted)}
+      title={dragPreviewTitle(draggingId, bookmarks, folders)}
+    />}
   </div>;
 }
+
+function dragPreviewIcon(
+  draggingId: string,
+  bookmarks: BookmarkRecord[],
+  folders: BookmarkFolderRecord[],
+  openTabs: TabRecord[],
+  faviconGranted: boolean,
+) {
+  const source = parseBookmarkDragSource(draggingId);
+  if (source?.type === 'bookmark') {
+    const bookmark = bookmarks.find((item) => item.id === source.id);
+    if (bookmark) {
+      const icon = resolveBookmarkFavicon(
+        bookmark.url,
+        openTabs,
+        faviconGranted ? chromeFaviconUrl(bookmark.url, (path) => chrome.runtime.getURL(path)) : undefined,
+      );
+      if (icon) return <img src={icon} alt="" />;
+    }
+    return <Globe2 size={14} />;
+  }
+  return folders.find((folder) => folder.id === source?.id) ? <Bookmark size={14} /> : <Globe2 size={14} />;
+}
+
+function dragPreviewTitle(
+  draggingId: string,
+  bookmarks: BookmarkRecord[],
+  folders: BookmarkFolderRecord[],
+): string {
+  const source = parseBookmarkDragSource(draggingId);
+  if (source?.type === 'bookmark') {
+    const bookmark = bookmarks.find((item) => item.id === source.id);
+    return bookmark?.title || bookmark?.url || '';
+  }
+  if (source?.type === 'folder') {
+    return folders.find((folder) => folder.id === source.id)?.title ?? '';
+  }
+  return '';
+}
+
+function BookmarkGroupRow({
+  name,
+  count,
+  collapsed,
+  icons,
+  surface,
+  rail = false,
+  droppable,
+  dropId,
+  parentId,
+  index,
+  dragging,
+  canDrag,
+  items,
+  t,
+  hint,
+  overflowCloseToken,
+  onOpenOverflow,
+  onToggle,
+  onPointerDown,
+  onContextMenu,
+}: {
+  name: string;
+  count: number;
+  collapsed: boolean;
+  icons: string[];
+  surface?: { wash: string; dot: string };
+  rail?: boolean;
+  droppable?: DragSurface;
+  dropId?: string;
+  parentId?: string;
+  index?: number;
+  dragging?: boolean;
+  canDrag?: boolean;
+  items: ContextMenuItem[];
+  t: Translator;
+  hint?: string;
+  overflowCloseToken: number;
+  onOpenOverflow: () => void;
+  onToggle?: () => void;
+  onPointerDown?: (event: React.PointerEvent<HTMLElement>) => void;
+  onContextMenu?: (event: React.MouseEvent) => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  useEffect(() => { setMenuOpen(false); }, [overflowCloseToken]);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setMenuOpen(false); };
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target?.closest('.group-row-shell')) setMenuOpen(false);
+    };
+    document.addEventListener('keydown', closeOnEscape);
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    return () => {
+      document.removeEventListener('keydown', closeOnEscape);
+      document.removeEventListener('pointerdown', closeOnOutsidePointer);
+    };
+  }, [menuOpen]);
+  const shellClass = [
+    'group-row-shell',
+    rail ? 'has-rail' : '',
+    dragging ? 'dragging' : '',
+  ].filter(Boolean).join(' ');
+  const style = surface
+    ? { '--group-wash': surface.wash, '--group-dot': surface.dot } as React.CSSProperties
+    : undefined;
+  const body = <>
+    {onToggle
+      ? <button className={canDrag ? 'group-row is-draggable' : 'group-row'} type="button" onPointerDown={canDrag ? onPointerDown : undefined} onDragStart={(event) => event.preventDefault()} onClick={onToggle} aria-expanded={!collapsed} title={hint}>
+        <span className="group-chevron">{collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}</span>
+        {!rail && <span className="group-dot neutral" />}
+        <span className="group-name">{name}</span>
+        <span className="group-count">{count}</span>
+        <FaviconStack icons={icons} />
+      </button>
+      : <div className="group-row">
+        {!rail && <span className="group-dot neutral" />}
+        <span className="group-name">{name}</span>
+        <span className="group-count">{count}</span>
+      </div>}
+    {items.length > 0 && <button
+      className="group-menu-button"
+      type="button"
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={(event) => { event.stopPropagation(); onOpenOverflow(); setMenuOpen((open) => !open); }}
+      aria-label={`${t('moreActions')} ${name}`}
+      aria-expanded={menuOpen}
+      aria-haspopup="menu"
+    ><MoreHorizontal size={15} /></button>}
+    {menuOpen && <div className="group-popover" role="menu">
+      {items.map((item) => <button
+        key={item.id}
+        type="button"
+        role="menuitem"
+        className={item.danger ? 'danger' : undefined}
+        disabled={item.disabled}
+        onClick={() => { item.onSelect(); setMenuOpen(false); }}
+      >{item.icon}<span>{item.label}</span></button>)}
+    </div>}
+  </>;
+  if (!droppable) {
+    return <div className={shellClass} style={style} title={hint} onContextMenu={onContextMenu}>{body}</div>;
+  }
+  return <DroppableSurface
+    surface={droppable}
+    className={shellClass}
+    style={style}
+    title={hint}
+    data-bookmark-drop={dropId}
+    data-bookmark-parent={parentId}
+    data-bookmark-index={index}
+    onContextMenu={onContextMenu}
+  >
+    {(over) => <>
+      {onToggle
+        ? <button className={canDrag ? 'group-row is-draggable' : 'group-row'} type="button" onPointerDown={canDrag ? onPointerDown : undefined} onDragStart={(event) => event.preventDefault()} onClick={onToggle} aria-expanded={!collapsed}>
+          <span className="group-chevron">{collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}</span>
+          {!rail && <span className="group-dot neutral" />}
+          <span className="group-name">{over ? t('dropToFile') : name}</span>
+          <span className="group-count">{count}</span>
+          <FaviconStack icons={icons} />
+        </button>
+        : <div className="group-row">
+          <span className="group-name">{over ? t('dropToFile') : name}</span>
+          <span className="group-count">{count}</span>
+        </div>}
+      {items.length > 0 && <button
+        className="group-menu-button"
+        type="button"
+        onPointerDown={(event) => event.stopPropagation()}
+        onClick={(event) => { event.stopPropagation(); onOpenOverflow(); setMenuOpen((open) => !open); }}
+        aria-label={`${t('moreActions')} ${name}`}
+        aria-expanded={menuOpen}
+        aria-haspopup="menu"
+      ><MoreHorizontal size={15} /></button>}
+      {menuOpen && <div className="group-popover" role="menu">
+        {items.map((item) => <button
+          key={item.id}
+          type="button"
+          role="menuitem"
+          className={item.danger ? 'danger' : undefined}
+          disabled={item.disabled}
+          onClick={() => { item.onSelect(); setMenuOpen(false); }}
+        >{item.icon}<span>{item.label}</span></button>)}
+      </div>}
+    </>}
+  </DroppableSurface>;
+}
+
+const BookmarkCard = memo(function BookmarkCard({
+  bookmark,
+  host,
+  icon,
+  dragging,
+  canDrag,
+  items,
+  t,
+  overflowCloseToken,
+  onOpenOverflow,
+  onPointerDown,
+  onOpen,
+  onContextMenu,
+}: {
+  bookmark: BookmarkRecord;
+  host: string;
+  icon?: string;
+  dragging: boolean;
+  canDrag: boolean;
+  items: ContextMenuItem[];
+  t: Translator;
+  overflowCloseToken: number;
+  onOpenOverflow: () => void;
+  onPointerDown: (event: React.PointerEvent<HTMLElement>) => void;
+  onOpen: () => void;
+  onContextMenu: (event: React.MouseEvent<HTMLDivElement>) => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuPlacement, setMenuPlacement] = useState<'up' | 'down'>('down');
+  useEffect(() => { setMenuOpen(false); }, [overflowCloseToken]);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setMenuOpen(false); };
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target?.closest('.tab-row')) setMenuOpen(false);
+    };
+    document.addEventListener('keydown', closeOnEscape);
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    return () => {
+      document.removeEventListener('keydown', closeOnEscape);
+      document.removeEventListener('pointerdown', closeOnOutsidePointer);
+    };
+  }, [menuOpen]);
+  const toggleMenu = (event: React.MouseEvent<HTMLButtonElement>) => {
+    onOpenOverflow();
+    if (menuOpen) {
+      setMenuOpen(false);
+      return;
+    }
+    const row = event.currentTarget.closest('.tab-row');
+    const rowBottom = row?.getBoundingClientRect().bottom ?? 0;
+    setMenuPlacement(rowBottom + 186 > window.innerHeight - 8 ? 'up' : 'down');
+    setMenuOpen(true);
+  };
+  const rowId = formatBookmarkRowId(bookmark.id);
+  return <div
+    className={['tab-row', 'is-card', dragging ? 'dragging' : ''].filter(Boolean).join(' ')}
+    data-bookmark-drop={rowId}
+    data-bookmark-parent={bookmark.parentId}
+    data-bookmark-index={bookmark.index}
+    onContextMenu={onContextMenu}
+  >
+    <div
+      className="tab-main"
+      role="button"
+      tabIndex={0}
+      title={bookmark.url || bookmark.title}
+      onPointerDown={canDrag ? onPointerDown : undefined}
+      onDragStart={(event) => event.preventDefault()}
+      onClick={onOpen}
+      onKeyDown={(event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        onOpen();
+      }}
+    >
+      <span className="favicon-wrap">{icon
+        ? <img src={icon} alt="" className="favicon" draggable={false} />
+        : <Globe2 size={15} />}</span>
+      <span className="tab-copy">
+        <span className="tab-title">{bookmark.title || bookmark.url}</span>
+        <span className="tab-host">{host}</span>
+      </span>
+    </div>
+    <button className="row-menu" type="button" onPointerDown={(event) => event.stopPropagation()} onClick={toggleMenu} aria-label={t('actionsFor', { title: bookmark.title || bookmark.url })} aria-expanded={menuOpen} aria-haspopup="menu"><MoreHorizontal size={16} /></button>
+    {menuOpen && <div className={menuPlacement === 'up' ? 'row-popover up' : 'row-popover'} role="menu">
+      {items.map((item) => <button
+        key={item.id}
+        type="button"
+        role="menuitem"
+        className={item.danger ? 'danger' : undefined}
+        disabled={item.disabled}
+        onClick={() => { item.onSelect(); setMenuOpen(false); }}
+      >{item.icon}<span>{item.label}</span></button>)}
+    </div>}
+  </div>;
+});

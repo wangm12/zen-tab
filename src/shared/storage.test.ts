@@ -1,5 +1,17 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { clearProjectMemory, listStashes, loadProjectMemory, loadSettings, loadWorkerBootstrap, saveProjectMemory } from './storage';
+import { BookmarkOrganizeSnapshot } from './types';
+import {
+  BOOKMARK_ORGANIZE_SNAPSHOTS_KEY,
+  clearProjectMemory,
+  deleteBookmarkOrganizeSnapshot,
+  listStashes,
+  loadBookmarkOrganizeSnapshots,
+  loadProjectMemory,
+  loadSettings,
+  loadWorkerBootstrap,
+  saveBookmarkOrganizeSnapshots,
+  saveProjectMemory,
+} from './storage';
 
 type MockStorage = Record<string, unknown>;
 
@@ -22,6 +34,17 @@ beforeEach(() => {
 });
 
 describe('storage validation', () => {
+  it('defaults atmosphere on and rejects non-boolean values', async () => {
+    const unset = await loadSettings();
+    expect(unset.atmosphereEnabled).toBe(true);
+    storage['zen-tab.settings'] = { atmosphereEnabled: 'no' };
+    const invalid = await loadSettings();
+    expect(invalid.atmosphereEnabled).toBe(true);
+    storage['zen-tab.settings'] = { atmosphereEnabled: false };
+    const off = await loadSettings();
+    expect(off.atmosphereEnabled).toBe(false);
+  });
+
   it('falls back safely when stored settings have invalid field types', async () => {
     storage['zen-tab.settings'] = {
       language: 'fr',
@@ -99,5 +122,87 @@ describe('storage validation', () => {
     expect((await loadProjectMemory())).toHaveLength(100);
     await clearProjectMemory();
     expect(await loadProjectMemory()).toEqual([]);
+  });
+});
+
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+function organizeSnapshot(id: string, createdAt: number, extra: Partial<BookmarkOrganizeSnapshot> = {}): BookmarkOrganizeSnapshot {
+  return {
+    id,
+    createdAt,
+    expiresAt: createdAt + WEEK_MS,
+    moveCount: 1,
+    createdFolderIds: [],
+    nodes: [{ id: 'n', parentId: '2', index: 0 }],
+    ...extra,
+  };
+}
+
+describe('bookmark organize snapshots', () => {
+  it('saves four snapshots and keeps the three newest after prune', async () => {
+    const now = Date.now();
+    await saveBookmarkOrganizeSnapshots([
+      organizeSnapshot('a', now - 3_000),
+      organizeSnapshot('b', now - 2_000),
+      organizeSnapshot('c', now - 1_000),
+      organizeSnapshot('d', now),
+    ]);
+    const loaded = await loadBookmarkOrganizeSnapshots();
+    expect(loaded.map((item) => item.id)).toEqual(['b', 'c', 'd']);
+    expect(storage[BOOKMARK_ORGANIZE_SNAPSHOTS_KEY]).toEqual(loaded);
+  });
+
+  it('returns no snapshots after saving an expired one', async () => {
+    await saveBookmarkOrganizeSnapshots([organizeSnapshot('old', Date.now() - WEEK_MS - 1_000)]);
+    expect(await loadBookmarkOrganizeSnapshots()).toEqual([]);
+  });
+
+  it('prunes expired leftovers planted on disk at load time', async () => {
+    const now = Date.now();
+    storage[BOOKMARK_ORGANIZE_SNAPSHOTS_KEY] = [
+      organizeSnapshot('old', now - WEEK_MS - 1_000),
+      organizeSnapshot('a', now - 3_000),
+      organizeSnapshot('b', now - 2_000),
+      organizeSnapshot('c', now - 1_000),
+      organizeSnapshot('d', now),
+    ];
+    const loaded = await loadBookmarkOrganizeSnapshots();
+    expect(loaded.map((item) => item.id)).toEqual(['b', 'c', 'd']);
+  });
+
+  it('drops node title/url and ignores malformed snapshots on load', async () => {
+    const now = Date.now();
+    storage[BOOKMARK_ORGANIZE_SNAPSHOTS_KEY] = [
+      {
+        id: 'good',
+        createdAt: now,
+        expiresAt: now + WEEK_MS,
+        moveCount: 2,
+        createdFolderIds: ['folder-1'],
+        nodes: [{ id: 'n1', parentId: '2', index: 1, title: 'Secret', url: 'https://example.com' }],
+      },
+      { id: 12, createdAt: now, expiresAt: now + WEEK_MS, nodes: [] },
+      { createdAt: now, expiresAt: now + WEEK_MS, nodes: [{ id: 'n', parentId: '2', index: 0 }] },
+    ];
+    const loaded = await loadBookmarkOrganizeSnapshots();
+    expect(loaded).toEqual([{
+      id: 'good',
+      createdAt: now,
+      expiresAt: now + WEEK_MS,
+      moveCount: 2,
+      createdFolderIds: ['folder-1'],
+      nodes: [{ id: 'n1', parentId: '2', index: 1 }],
+    }]);
+  });
+
+  it('deletes a snapshot by id', async () => {
+    const now = Date.now();
+    await saveBookmarkOrganizeSnapshots([
+      organizeSnapshot('keep', now - 1_000),
+      organizeSnapshot('gone', now),
+    ]);
+    await deleteBookmarkOrganizeSnapshot('gone');
+    expect((await loadBookmarkOrganizeSnapshots()).map((item) => item.id)).toEqual(['keep']);
   });
 });

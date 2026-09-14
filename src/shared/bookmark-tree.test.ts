@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import { BookmarkFolderRecord, BookmarkRecord } from './types';
-import { buildBookmarkForest, inboxBookmarks } from './bookmark-tree';
+import { INBOX_COLLAPSE_ID, buildBookmarkForest, flattenVisibleBookmarkRows, inboxBookmarks } from './bookmark-tree';
 
 function folder(overrides: Partial<BookmarkFolderRecord> & Pick<BookmarkFolderRecord, 'id' | 'title'>): BookmarkFolderRecord {
   return {
@@ -8,6 +8,8 @@ function folder(overrides: Partial<BookmarkFolderRecord> & Pick<BookmarkFolderRe
     isInbox: false,
     isSpecialRoot: false,
     isBookmarksBar: false,
+    folderKind: 'folder',
+    index: 0,
     ...overrides,
   };
 }
@@ -18,6 +20,8 @@ function bookmark(overrides: Partial<BookmarkRecord> & Pick<BookmarkRecord, 'id'
     folderPath: overrides.title,
     isInbox: false,
     isBookmarksBar: false,
+    folderKind: 'folder',
+    index: 0,
     ...overrides,
   };
 }
@@ -29,6 +33,7 @@ const bar = folder({
   folderPath: 'Bookmarks Bar',
   isSpecialRoot: true,
   isBookmarksBar: true,
+  folderKind: 'bar',
 });
 
 const other = folder({
@@ -38,6 +43,7 @@ const other = folder({
   folderPath: '其他书签',
   isSpecialRoot: true,
   isInbox: true,
+  folderKind: 'other',
 });
 
 const engineering = folder({
@@ -150,6 +156,21 @@ describe('buildBookmarkForest', () => {
     });
   });
 
+  test('does not promote a nested bar-kind folder to a second root', () => {
+    const nestedBar = folder({
+      id: 'nested-bar',
+      parentId: '1',
+      title: 'Bookmarks Bar',
+      folderPath: 'Bookmarks Bar / Bookmarks Bar',
+      folderKind: 'bar',
+      isBookmarksBar: true,
+      isSpecialRoot: true,
+    });
+    const forest = buildBookmarkForest([bar, nestedBar], []);
+    expect(forest.map((node) => node.kind === 'folder' ? node.folder.id : node.bookmark.id)).toEqual(['1']);
+    expect(forest[0].kind === 'folder' && forest[0].children.map((node) => node.kind === 'folder' ? node.folder.id : node.bookmark.id)).toEqual(['nested-bar']);
+  });
+
   test('Bookmarks Bar appears as a root', () => {
     const pinned = bookmark({
       id: 'pinned',
@@ -202,6 +223,7 @@ describe('buildBookmarkForest', () => {
       parentId: 'parent',
       title: 'Child',
       folderPath: '其他书签 / Parent / Child',
+      index: 1,
     });
     const deep = bookmark({
       id: 'deep',
@@ -214,6 +236,7 @@ describe('buildBookmarkForest', () => {
       parentId: 'parent',
       title: 'Sibling',
       folderPath: '其他书签 / Parent',
+      index: 0,
     });
 
     const forest = buildBookmarkForest([other, parent, child], [deep, sibling]);
@@ -228,5 +251,161 @@ describe('buildBookmarkForest', () => {
       ? forest[0].children.find((node) => node.kind === 'folder')
       : undefined;
     expect(nestedFolder).toMatchObject({ kind: 'folder', folder: child, count: 1 });
+  });
+
+  test('mixes folders and bookmarks by index', () => {
+    const parent = folder({ id: 'p', parentId: '2', title: 'P', folderPath: '其他书签 / P', folderKind: 'folder' });
+    const zebra = folder({ id: 'z', parentId: 'p', title: 'Zebra', index: 1, folderPath: '其他书签 / P / Zebra' });
+    const alpha = bookmark({ id: 'a', parentId: 'p', title: 'Alpha', index: 0 });
+    const forest = buildBookmarkForest([other, parent, zebra], [alpha]);
+    const kids = forest[0].kind === 'folder' ? forest[0].children : [];
+    expect(kids.map((node) => node.kind === 'folder' ? node.folder.id : node.bookmark.id)).toEqual(['a', 'z']);
+  });
+
+  test('shows Mobile as a folder and keeps mobile URLs out of the inbox tray', () => {
+    const mobile = folder({
+      id: '3',
+      parentId: '0',
+      title: 'Mobile Bookmarks',
+      folderPath: 'Mobile Bookmarks',
+      isSpecialRoot: true,
+      folderKind: 'mobile',
+      index: 2,
+    });
+    const phone = bookmark({
+      id: 'm1',
+      parentId: '3',
+      title: 'Phone',
+      folderKind: 'mobile',
+      isInbox: false,
+    });
+    expect(inboxBookmarks([phone], [mobile, other])).toEqual([]);
+    const forest = buildBookmarkForest([bar, other, mobile], [phone]);
+    expect(forest.some((node) => node.kind === 'folder' && node.folder.id === '3')).toBe(true);
+    expect(forest.find((node) => node.kind === 'folder' && node.folder.id === '3')).toMatchObject({
+      count: 1,
+      children: [{ kind: 'bookmark', bookmark: phone }],
+    });
+  });
+
+  test('shows Managed as a read-only root', () => {
+    const managed = folder({
+      id: '99',
+      parentId: '0',
+      title: 'Managed Bookmarks',
+      folderPath: 'Managed Bookmarks',
+      isSpecialRoot: true,
+      folderKind: 'managed',
+      unmodifiable: 'managed',
+      index: 3,
+    });
+    const policy = bookmark({
+      id: 'policy',
+      parentId: '99',
+      title: 'Policy',
+      folderKind: 'managed',
+      unmodifiable: 'managed',
+    });
+    const forest = buildBookmarkForest([bar, other, managed], [policy]);
+    expect(forest.some((node) => node.kind === 'folder' && node.folder.id === '99')).toBe(true);
+  });
+});
+
+describe('flattenVisibleBookmarkRows', () => {
+  test('omits children of collapsed folders and keeps inbox rows', () => {
+    const work = folder({
+      id: 'work',
+      parentId: '1',
+      title: 'Work',
+      folderPath: 'Bookmarks Bar / Work',
+    });
+    const doc = bookmark({
+      id: 'doc',
+      parentId: 'work',
+      title: 'Doc',
+      folderPath: 'Bookmarks Bar / Work',
+      isBookmarksBar: true,
+    });
+    const loose = bookmark({
+      id: 'loose',
+      parentId: '2',
+      title: 'Loose',
+      folderPath: '其他书签',
+      isInbox: true,
+    });
+    const forest = buildBookmarkForest([bar, work], [doc]);
+
+    expect(flattenVisibleBookmarkRows({
+      forest,
+      collapsedFolderIds: new Set(['1']),
+      inbox: [loose],
+      includeInbox: true,
+    }).map((row) => `${row.kind}:${row.kind === 'folder' ? row.folder.id : row.kind === 'bookmark' ? row.bookmark.id : 'count' in row ? row.count : ''}`)).toEqual([
+      'inbox:1',
+      'bookmark:loose',
+      'folder:1',
+    ]);
+
+    expect(flattenVisibleBookmarkRows({
+      forest,
+      collapsedFolderIds: new Set(),
+      inbox: [loose],
+      includeInbox: true,
+    }).map((row) => row.kind === 'folder' ? row.folder.id : row.kind === 'bookmark' ? row.bookmark.id : row.kind)).toEqual([
+      'inbox',
+      'loose',
+      '1',
+      'work',
+      'doc',
+    ]);
+  });
+
+  test('search results skip the tree and inbox', () => {
+    const hit = bookmark({ id: 'hit', parentId: '1', title: 'Hit' });
+    expect(flattenVisibleBookmarkRows({
+      forest: [],
+      collapsedFolderIds: new Set(),
+      inbox: [hit],
+      includeInbox: true,
+      searching: true,
+      searchHits: [hit],
+    }).map((row) => row.kind)).toEqual(['search', 'bookmark']);
+  });
+
+  test('hides inbox children when the inbox group is collapsed', () => {
+    const loose = bookmark({
+      id: 'loose',
+      parentId: '2',
+      title: 'Loose',
+      folderPath: '其他书签',
+      isInbox: true,
+    });
+    expect(flattenVisibleBookmarkRows({
+      forest: [],
+      collapsedFolderIds: new Set([INBOX_COLLAPSE_ID]),
+      inbox: [loose],
+      includeInbox: true,
+    }).map((row) => row.kind === 'inbox' ? `inbox:${row.collapsed}` : row.kind)).toEqual(['inbox:true']);
+  });
+
+  test('emits empty-slot row for expanded folders with 0 children', () => {
+    const empty = folder({
+      id: 'empty',
+      parentId: '1',
+      title: 'Empty Folder',
+      folderPath: 'Bookmarks Bar / Empty Folder',
+    });
+    const forest = buildBookmarkForest([bar, empty], []);
+    const rows = flattenVisibleBookmarkRows({
+      forest,
+      collapsedFolderIds: new Set(),
+      inbox: [],
+      includeInbox: false,
+    });
+    expect(rows).toEqual([
+      { kind: 'folder', folder: bar, count: 0, depth: 0, collapsed: false },
+      { kind: 'folder', folder: empty, count: 0, depth: 1, collapsed: false },
+      { kind: 'empty-slot', folderId: 'empty', depth: 2 },
+    ]);
   });
 });

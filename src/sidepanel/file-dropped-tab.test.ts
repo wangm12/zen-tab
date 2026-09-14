@@ -1,7 +1,7 @@
 import { describe, expect, test, vi } from 'vitest';
 import { TabRecord } from '../shared/types';
 import { Translator } from './i18n';
-import { bookmarkNavTabDragOver, fileDroppedTab } from './file-dropped-tab';
+import { fileDroppedTab } from './file-dropped-tab';
 
 const t = ((key: string) => key) as Translator;
 
@@ -79,14 +79,5 @@ describe('fileDroppedTab', () => {
       message: 'bookmarksCreated',
     }));
     expect(showToast.mock.calls[0][0]).not.toHaveProperty('action');
-  });
-});
-
-describe('bookmarkNavTabDragOver', () => {
-  test('reveals bookmarks while a tab drag is still held so tray and folders can receive it', () => {
-    expect(bookmarkNavTabDragOver(['text/plain'], 'tabs')).toEqual({ accept: false, switchToBookmarks: false });
-    expect(bookmarkNavTabDragOver(['text/tab-id'], 'tabs')).toEqual({ accept: true, switchToBookmarks: true });
-    expect(bookmarkNavTabDragOver(['text/tab-id'], 'stashes')).toEqual({ accept: true, switchToBookmarks: true });
-    expect(bookmarkNavTabDragOver(['text/tab-id'], 'bookmarks')).toEqual({ accept: true, switchToBookmarks: false });
   });
 });

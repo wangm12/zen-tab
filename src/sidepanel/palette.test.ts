@@ -47,6 +47,8 @@ const bookmarks: BookmarkRecord[] = [{
   folderPath: 'Bookmarks bar / Engineering',
   isInbox: false,
   isBookmarksBar: true,
+  folderKind: 'bar',
+  index: 0,
 }];
 
 const stashes: StashRecord[] = [{
@@ -137,5 +139,73 @@ describe('command palette entries', () => {
     expect(entries.some((entry) => entry.commandId === 'jump-bookmark')).toBe(false);
     expect(entries.some((entry) => entry.commandId === 'jump-stash')).toBe(false);
     expect(entries.some((entry) => entry.commandId === 'switch-window')).toBe(true);
+  });
+
+  it('identifies and tags active tabs with badge and isActive property', () => {
+    const entries = buildPaletteEntries(windows, '', t);
+    const activeTabEntry = entries.find((entry) => entry.id === 'tab-101');
+    expect(activeTabEntry).toEqual(expect.objectContaining({
+      commandId: 'jump-tab',
+      kind: 'active-tab',
+      badge: 'Active',
+      isActive: true,
+      url: 'https://example.com',
+    }));
+  });
+
+  it('matches the active tab when querying "active"', () => {
+    const entries = buildPaletteEntries(windows, 'active', t);
+    expect(entries.some((entry) => entry.id === 'tab-101' && entry.isActive)).toBe(true);
+  });
+
+  it('resolves favicon and tags bookmarks with Bookmark badge', () => {
+    const bookmarkMatchingOpenTab: BookmarkRecord = {
+      id: 'bm-example',
+      parentId: 'folder-1',
+      title: 'Example site',
+      url: 'https://example.com',
+      folderPath: 'Bookmarks bar',
+      isInbox: false,
+      isBookmarksBar: true,
+      folderKind: 'bar',
+      index: 0,
+    };
+    const entries = buildPaletteEntries(windows, 'example', t, [bookmarkMatchingOpenTab]);
+    const bmEntry = entries.find((entry) => entry.id === 'bookmark-bm-example');
+    expect(bmEntry).toEqual(expect.objectContaining({
+      commandId: 'jump-bookmark',
+      kind: 'bookmark',
+      badge: 'Bookmark',
+      favIconUrl: 'https://example.com/favicon.ico',
+    }));
+  });
+
+  it('matches open tabs when searching by URL path/tokens', () => {
+    const multiTabWindows: WindowSnapshot[] = [{
+      windowId: 1,
+      focused: true,
+      incognito: false,
+      groups: [],
+      tabs: [{
+        tabId: 999,
+        windowId: 1,
+        incognito: false,
+        url: 'https://ouraring.com/product/horizon-silver',
+        canonicalUrl: 'https://ouraring.com/product/horizon-silver',
+        title: 'Smart Ring',
+        favIconUrl: 'https://ouraring.com/favicon.ico',
+        groupId: -1,
+        pinned: false,
+        active: false,
+        audible: false,
+        discarded: false,
+        autoDiscardable: true,
+        muted: false,
+        index: 0,
+        createdAt: 1,
+      }],
+    }];
+    const entries = buildPaletteEntries(multiTabWindows, 'horizon-silver', t);
+    expect(entries.some((entry) => entry.id === 'tab-999')).toBe(true);
   });
 });

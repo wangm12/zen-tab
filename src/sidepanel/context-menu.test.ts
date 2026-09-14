@@ -54,15 +54,17 @@ describe('context menu specs', () => {
       { id: 'stash', label: 'stash' },
       { id: 'mute', label: 'unmute' },
       { id: 'pin', label: 'unpin' },
-      { id: 'discard', label: 'discarded' },
+      { id: 'discard', label: 'discardTab' },
       { id: 'close', label: 'close', danger: true },
     ]);
   });
 
-  it('builds stash-only items for synthetic Ungrouped and full group actions otherwise', () => {
-    expect(buildGroupContextSpecs({ t, synthetic: true })).toEqual([{ id: 'stash', label: 'stash' }]);
+  it('adds select/group/close on Ungrouped and keeps rename/color on real groups', () => {
+    expect(buildGroupContextSpecs({ t, synthetic: true }).map((item) => item.id)).toEqual([
+      'stash', 'select-all', 'group-tabs', 'close-all',
+    ]);
     expect(buildGroupContextSpecs({ t, synthetic: false }).map((item) => item.id)).toEqual([
-      'rename', 'colors', 'stash', 'ungroup',
+      'rename', 'colors', 'stash', 'select-all', 'close-all', 'ungroup',
     ]);
     expect(buildGroupContextSpecs({ t, synthetic: false })).toContainEqual({
       id: 'colors',
@@ -85,17 +87,14 @@ describe('context menu specs', () => {
     ]);
   });
 
-  it('adds File only for inbox bookmarks and emits collapse or expand from folder state', () => {
-    expect(buildBookmarkRowContextSpecs({ t, isInbox: false })).toEqual([{ id: 'open', label: 'openBookmark' }]);
-    expect(buildBookmarkRowContextSpecs({ t, isInbox: true })).toEqual([
-      { id: 'open', label: 'openBookmark' },
-      { id: 'file', label: 'fileBookmark' },
-    ]);
-    expect(buildBookmarkGroupContextSpecs({ t, collapsed: false })).toEqual([
-      { id: 'collapse', label: 'collapseFolder' },
-    ]);
-    expect(buildBookmarkGroupContextSpecs({ t, collapsed: true })).toEqual([
-      { id: 'expand', label: 'expandFolder' },
-    ]);
+  it('builds bookmark row and folder menus from mutate + inbox flags', () => {
+    expect(buildBookmarkRowContextSpecs({ t, isInbox: false, canMutate: false }).map((item) => item.id))
+      .toEqual(['open']);
+    expect(buildBookmarkRowContextSpecs({ t, isInbox: true, canMutate: true }).map((item) => item.id))
+      .toEqual(['open', 'file', 'edit', 'delete']);
+    expect(buildBookmarkGroupContextSpecs({ t, collapsed: false, canMutate: true, isSpecialRoot: false }).map((item) => item.id))
+      .toEqual(['collapse', 'open-all', 'new-folder', 'rename', 'delete']);
+    expect(buildBookmarkGroupContextSpecs({ t, collapsed: true, canMutate: false, isSpecialRoot: true }).map((item) => item.id))
+      .toEqual(['expand', 'open-all']);
   });
 });

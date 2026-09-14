@@ -9,19 +9,50 @@ import {
 } from '../shared/duplicate';
 import {
   BookmarkFileMove,
+  BookmarkIndexMove,
+  assertFileableBookmarkParent,
+  assertMutableBookmarkNode,
+  bookmarkMoveIndex,
+  canFileIntoBookmarkParent,
   canRestoreBookmarkIntoParent,
   existingCanonicalUrlsInBookmarkParent,
   flattenBookmarkTree,
+  isBookmarkMoveCycle,
   planBookmarkCreates,
   shouldRestoreFiledBookmark,
+  shouldRestoreMovedBookmark,
   suggestBookmarkFolder,
   validateBookmarkDedupGroups,
 } from '../shared/bookmarks';
+import { decideCreatedBookmarkAction, shouldSuppressCreatedBookmarkFiling } from '../shared/bookmark-created';
 import {
   restoreCreatedBookmarkIds,
   shouldIgnoreBookmarkCreated,
   withBookmarkCreatedFilingSuppressed,
 } from '../shared/bookmark-create-undo';
+import { resolveFilingMoves } from '../shared/bookmark-filing';
+import {
+  BOOKMARK_ORGANIZE_SNAPSHOT_TTL_MS,
+  BookmarkOrganizeProposal,
+  commitInsertedOrganizeSnapshot,
+  constrainOrganizePlan,
+  emptyCreatedOrganizeFolders,
+  finalizeOrganizeSnapshot,
+  insertOrganizeSnapshot,
+  mergeTopicWithHostOrganize,
+  organizeApplyFinalizeInput,
+  planBookmarkOrganizeRestore,
+  proposeBookmarkOrganize,
+  toBookmarkOrganizeSnapshotSummary,
+} from '../shared/bookmark-organize';
+import {
+  BOOKMARK_ORGANIZE_CLOUD_LIMIT,
+  BOOKMARK_ORGANIZE_LOCAL_LIMIT,
+  buildTopicAnalyzePayload,
+  requestTopicOrganizeJson,
+  selectAnalyzeBookmarks,
+  topicProposalFromModel,
+} from '../shared/bookmark-organize-ai';
 import { isEligibleProposalTab, selectEligibleGroupTabs, validateGroupTabsInput } from '../shared/group-tabs';
 import { canUseBookmarksApi } from '../shared/optional-api';
 import { groupRecordFromChrome, tabRecordFromChrome } from '../shared/tab-record';
@@ -49,13 +80,18 @@ import {
   TabRestoreDescriptor,
   RecentSession,
   BookmarkRecord,
+  BookmarkOrganizeScope,
+  ProviderCapabilities,
 } from '../shared/types';
 import {
   clearLastAction,
+  deleteBookmarkOrganizeSnapshot,
   deleteStash,
   listStashes,
+  loadBookmarkOrganizeSnapshots,
   loadWorkerBootstrap,
   clearProjectMemory,
+  saveBookmarkOrganizeSnapshots,
   saveGroqApiKey,
   saveLastAction,
   saveProjectMemory,
@@ -87,10 +123,19 @@ type DuplicateUndoData = {
   };
 };
 
+type BookmarkFilingResult = {
+  moved: number;
+  skipped: number;
+  created: Array<{ clientId: string; id: string }>;
+};
+
 type BookmarkUndoData =
-  | { kind: 'file'; moves: BookmarkFileMove[] }
+  | { kind: 'file'; moves: BookmarkFileMove[]; organizeSnapshotId?: string; createdFolderIds?: string[] }
   | { kind: 'dedup'; removed: Array<{ id: string; title: string; url: string; parentId: string; index: number }> }
-  | { kind: 'create'; created: Array<{ id: string }> };
+  | { kind: 'create'; created: Array<{ id: string }> }
+  | { kind: 'move'; moves: BookmarkIndexMove[] }
+  | { kind: 'edit'; id: string; previousTitle: string; previousUrl?: string }
+  | { kind: 'folder-create'; id: string };
 
 const AUTO_DISCARD_ALARM = 'zen-tab-auto-discard';
 const PENDING_BOOKMARK_FILING_KEY = 'zen-tab.pending-bookmark-filing';
@@ -311,7 +356,20 @@ async function persistAction(action: ActionJournal): Promise<void> {
 }
 
 async function checkpointBookmarkUndo(action: ActionJournal, data: BookmarkUndoData): Promise<void> {
-  const remaining = data.kind === 'file' ? data.moves.length : data.kind === 'dedup' ? data.removed.length : data.created.length;
+  const remaining = (() => {
+    switch (data.kind) {
+      case 'file':
+      case 'move':
+        return data.moves.length;
+      case 'dedup':
+        return data.removed.length;
+      case 'create':
+        return data.created.length;
+      case 'edit':
+      case 'folder-create':
+        return 1;
+    }
+  })();
   if (remaining > 0) {
     await persistAction({ ...action, restoreData: data });
     return;
@@ -329,6 +387,20 @@ async function hasBookmarksPermission(): Promise<boolean> {
   }
 }
 
+async function requireBookmarksPermission(): Promise<void> {
+  if (!(await hasBookmarksPermission())) throw new Error('Bookmark access is required.');
+}
+
+async function getLiveBookmarkNode(id: string): Promise<chrome.bookmarks.BookmarkTreeNode> {
+  try {
+    const live = (await chrome.bookmarks.get(id))[0];
+    if (live) return live;
+  } catch {
+    // Missing ids are rejected below.
+  }
+  throw new Error('That bookmark is no longer available.');
+}
+
 async function getBookmarkTreeData(): Promise<{
   granted: boolean;
   bookmarks: ReturnType<typeof flattenBookmarkTree>['bookmarks'];
@@ -339,7 +411,438 @@ async function getBookmarkTreeData(): Promise<{
   return { granted: true, ...flattened };
 }
 
+async function updateBookmark(id: string, title: string, url?: string): Promise<{ updated: true }> {
+  await requireBookmarksPermission();
+  const live = await getLiveBookmarkNode(id);
+  const folders = flattenBookmarkTree(await chrome.bookmarks.getTree()).folders;
+  assertMutableBookmarkNode(live, folders);
+  if (url !== undefined && !live.url) throw new Error('That bookmark cannot be changed.');
+  await runBookmarkBatch(async () => {
+    await chrome.bookmarks.update(id, {
+      title,
+      ...(url !== undefined ? { url } : {}),
+    });
+  });
+  await persistAction({
+    actionId: createId('action'),
+    type: 'bookmark',
+    createdAt: Date.now(),
+    affectedTabIds: [],
+    restoreData: {
+      kind: 'edit',
+      id,
+      previousTitle: live.title,
+      ...(live.url ? { previousUrl: live.url } : {}),
+    } satisfies BookmarkUndoData,
+    expiresAt: Date.now() + 30_000,
+  });
+  return { updated: true };
+}
+
+async function removeBookmark(id: string): Promise<{ removed: number }> {
+  await requireBookmarksPermission();
+  const live = await getLiveBookmarkNode(id);
+  const folders = flattenBookmarkTree(await chrome.bookmarks.getTree()).folders;
+  assertMutableBookmarkNode(live, folders);
+  if (!live.url) throw new Error('That bookmark cannot be changed.');
+  await runBookmarkBatch(async () => {
+    await chrome.bookmarks.remove(id);
+  });
+  await persistAction({
+    actionId: createId('action'),
+    type: 'bookmark',
+    createdAt: Date.now(),
+    affectedTabIds: [],
+    restoreData: {
+      kind: 'dedup',
+      removed: [{
+        id,
+        title: live.title,
+        url: live.url,
+        parentId: live.parentId ?? '',
+        index: live.index ?? 0,
+      }],
+    } satisfies BookmarkUndoData,
+    expiresAt: Date.now() + 30_000,
+  });
+  return { removed: 1 };
+}
+
+async function createBookmarkFolder(parentId: string, title: string): Promise<{ id: string }> {
+  await requireBookmarksPermission();
+  const parent = await getLiveBookmarkNode(parentId);
+  const folders = flattenBookmarkTree(await chrome.bookmarks.getTree()).folders;
+  if (parent.url) throw new Error('That bookmark cannot be changed.');
+  assertFileableBookmarkParent(parentId, folders);
+  const created = await runBookmarkBatch(() => chrome.bookmarks.create({ parentId, title }));
+  await persistAction({
+    actionId: createId('action'),
+    type: 'bookmark',
+    createdAt: Date.now(),
+    affectedTabIds: [],
+    restoreData: { kind: 'folder-create', id: created.id } satisfies BookmarkUndoData,
+    expiresAt: Date.now() + 30_000,
+  });
+  return { id: created.id };
+}
+
+async function removeBookmarkFolder(id: string): Promise<{ removed: true }> {
+  await requireBookmarksPermission();
+  const live = await getLiveBookmarkNode(id);
+  const folders = flattenBookmarkTree(await chrome.bookmarks.getTree()).folders;
+  assertMutableBookmarkNode(live, folders);
+  if (live.url) throw new Error('That bookmark cannot be changed.');
+  await runBookmarkBatch(async () => {
+    await chrome.bookmarks.removeTree(id);
+  });
+  await clearLastAction();
+  lastAction = undefined;
+  snapshotDirty = true;
+  return { removed: true };
+}
+
+async function moveBookmark(id: string, parentId: string, index?: number): Promise<{ moved: true }> {
+  await requireBookmarksPermission();
+  const live = await getLiveBookmarkNode(id);
+  const flattened = flattenBookmarkTree(await chrome.bookmarks.getTree());
+  assertMutableBookmarkNode(live, flattened.folders);
+  const dest = await getLiveBookmarkNode(parentId);
+  if (dest.url) throw new Error('That bookmark cannot be changed.');
+  assertFileableBookmarkParent(parentId, flattened.folders);
+  if (!live.url && isBookmarkMoveCycle(id, parentId, flattened.folders)) {
+    throw new Error('That bookmark cannot be changed.');
+  }
+  const destination = index === undefined ? { parentId } : { parentId, index };
+  const moved = await runBookmarkBatch(() => chrome.bookmarks.move(id, destination));
+  await persistAction({
+    actionId: createId('action'),
+    type: 'bookmark',
+    createdAt: Date.now(),
+    affectedTabIds: [],
+    restoreData: {
+      kind: 'move',
+      moves: [{
+        id,
+        fromParentId: live.parentId ?? '',
+        fromIndex: live.index ?? 0,
+        toParentId: moved.parentId ?? parentId,
+        toIndex: moved.index ?? index ?? 0,
+      }],
+    } satisfies BookmarkUndoData,
+    expiresAt: Date.now() + 30_000,
+  });
+  return { moved: true };
+}
+
+async function openBookmarkUrls(urls: string[]): Promise<{ opened: number }> {
+  await requireBookmarksPermission();
+  const focused = await chrome.windows.getLastFocused().catch(() => undefined);
+  let opened = 0;
+  for (const url of urls) {
+    const created = await chrome.tabs.create({
+      url,
+      ...(focused?.id != null ? { windowId: focused.id } : {}),
+    });
+    exemptFromDuplicateGuard(created.id);
+    opened += 1;
+  }
+  return { opened };
+}
+
+async function applyBookmarkFiling(
+  creates: Array<{ clientId: string; parentId: string; title: string }>,
+  moves: Array<{ bookmarkId: string; folderId: string }>,
+  options?: { organizeSnapshotId?: string; progress?: BookmarkFilingResult },
+): Promise<BookmarkFilingResult> {
+  if (!(await hasBookmarksPermission())) throw new Error('Bookmark access is required.');
+  const createdByClientId = new Map<string, string>();
+  const clientIds = new Set(creates.map((create) => create.clientId));
+  const completed: BookmarkFileMove[] = [];
+  const syncProgress = (): BookmarkFilingResult => {
+    const result = {
+      moved: completed.length,
+      skipped: moves.length - completed.length,
+      created: [...createdByClientId].map(([clientId, id]) => ({ clientId, id })),
+    };
+    if (options?.progress) {
+      options.progress.moved = result.moved;
+      options.progress.skipped = result.skipped;
+      options.progress.created = result.created;
+    }
+    return result;
+  };
+  const persistCompleted = async () => {
+    syncProgress();
+    if (!completed.length) return;
+    const createdFolderIds = [...createdByClientId.values()];
+    await persistAction({
+      actionId: createId('action'),
+      type: 'bookmark',
+      createdAt: Date.now(),
+      affectedTabIds: [],
+      restoreData: {
+        kind: 'file',
+        moves: completed,
+        ...(options?.organizeSnapshotId ? { organizeSnapshotId: options.organizeSnapshotId } : {}),
+        ...(createdFolderIds.length ? { createdFolderIds } : {}),
+      } satisfies BookmarkUndoData,
+      expiresAt: Date.now() + 30_000,
+    });
+  };
+  const folders = flattenBookmarkTree(await chrome.bookmarks.getTree()).folders;
+  await runBookmarkBatch(async () => {
+    try {
+      for (const create of creates) {
+        try {
+          const parent = (await chrome.bookmarks.get(create.parentId))[0];
+          if (!parent || parent.url || !canFileIntoBookmarkParent(create.parentId, folders)) continue;
+          const node = await chrome.bookmarks.create({ parentId: create.parentId, title: create.title });
+          createdByClientId.set(create.clientId, node.id);
+          syncProgress();
+        } catch {
+          // Missing parents skip; rows targeting the client id are dropped later.
+        }
+      }
+      const createdIds = new Set(createdByClientId.values());
+      for (const move of resolveFilingMoves(moves, createdByClientId, clientIds)) {
+        try {
+          const live = (await chrome.bookmarks.get(move.bookmarkId))[0];
+          if (!live?.url || !live.parentId || live.parentId === move.folderId) continue;
+          if (!createdIds.has(move.folderId) && !canFileIntoBookmarkParent(move.folderId, folders)) continue;
+          await chrome.bookmarks.move(move.bookmarkId, { parentId: move.folderId });
+          completed.push({
+            id: move.bookmarkId,
+            fromParentId: live.parentId,
+            fromIndex: live.index ?? 0,
+            toParentId: move.folderId,
+          });
+          syncProgress();
+        } catch {
+          // Missing live nodes skip and continue.
+        }
+      }
+    } catch (error) {
+      await persistCompleted();
+      throw error;
+    }
+  });
+  await persistCompleted();
+  return syncProgress();
+}
+
+async function applyBookmarkOrganize(
+  creates: Array<{ clientId: string; parentId: string; title: string }>,
+  moves: Array<{ bookmarkId: string; folderId: string }>,
+  scope?: BookmarkOrganizeScope,
+): Promise<{ moved: number; skipped: number; created: Array<{ clientId: string; id: string }>; snapshotSaved: boolean }> {
+  if (!(await hasBookmarksPermission())) throw new Error('Bookmark access is required.');
+  const { bookmarks, folders } = flattenBookmarkTree(await chrome.bookmarks.getTree());
+  const constrained = constrainOrganizePlan({ creates, moves }, bookmarks, folders, scope);
+  if (!constrained.moves.length) {
+    return { moved: 0, skipped: 0, created: [], snapshotSaved: false };
+  }
+
+  const nodes: Array<{ id: string; parentId: string; index: number }> = [];
+  for (const move of constrained.moves) {
+    try {
+      const live = (await chrome.bookmarks.get(move.bookmarkId))[0];
+      if (!live?.url || !live.parentId) continue;
+      nodes.push({ id: live.id, parentId: live.parentId, index: live.index ?? 0 });
+    } catch {
+      // Vanished nodes are omitted from the compact snapshot.
+    }
+  }
+
+  const createdAt = Date.now();
+  const snapshot = {
+    id: createId('organize'),
+    createdAt,
+    expiresAt: createdAt + BOOKMARK_ORGANIZE_SNAPSHOT_TTL_MS,
+    moveCount: 0,
+    createdFolderIds: [] as string[],
+    nodes,
+  };
+  let snapshotSaved = true;
+  let evicted: Awaited<ReturnType<typeof loadBookmarkOrganizeSnapshots>> = [];
+  try {
+    const existing = await loadBookmarkOrganizeSnapshots();
+    const inserted = insertOrganizeSnapshot(existing, snapshot, createdAt);
+    evicted = inserted.evicted;
+    await saveBookmarkOrganizeSnapshots(inserted.next);
+  } catch {
+    snapshotSaved = false;
+    evicted = [];
+  }
+
+  const progress: BookmarkFilingResult = { moved: 0, skipped: 0, created: [] };
+  let result: BookmarkFilingResult | undefined;
+  try {
+    result = await applyBookmarkFiling(constrained.creates, constrained.moves, {
+      organizeSnapshotId: snapshot.id,
+      progress,
+    });
+    return { ...result, snapshotSaved };
+  } finally {
+    const { createdFolderIds, moveCount } = organizeApplyFinalizeInput(result, progress);
+    const finalized = finalizeOrganizeSnapshot(snapshot, createdFolderIds, moveCount);
+    try {
+      const stored = await loadBookmarkOrganizeSnapshots();
+      await saveBookmarkOrganizeSnapshots(
+        commitInsertedOrganizeSnapshot(stored, snapshot.id, finalized, evicted, Date.now()),
+      );
+    } catch {
+      // Quota or storage errors leave the pre-apply snapshot in place.
+    }
+  }
+}
+
+async function removeEmptyCreatedOrganizeFolders(createdFolderIds: string[]): Promise<number> {
+  if (!createdFolderIds.length) return 0;
+  const after = flattenBookmarkTree(await chrome.bookmarks.getTree());
+  const afterCounts = folderChildCountsFromFlatten(after.bookmarks, after.folders);
+  const deleteFolderIds = emptyCreatedOrganizeFolders(createdFolderIds, after.folders, afterCounts);
+  let deletedFolders = 0;
+  for (const id of deleteFolderIds) {
+    if ((afterCounts.get(id) ?? 0) !== 0) continue;
+    try {
+      const children = await chrome.bookmarks.getChildren(id);
+      if (children.length) continue;
+      await chrome.bookmarks.remove(id);
+      deletedFolders += 1;
+    } catch {
+      // Missing or non-empty folders skip.
+    }
+  }
+  return deletedFolders;
+}
+
+function folderChildCountsFromFlatten(
+  bookmarks: ReturnType<typeof flattenBookmarkTree>['bookmarks'],
+  folders: ReturnType<typeof flattenBookmarkTree>['folders'],
+): Map<string, number> {
+  const counts = new Map<string, number>();
+  const bump = (parentId: string | undefined) => {
+    if (!parentId) return;
+    counts.set(parentId, (counts.get(parentId) ?? 0) + 1);
+  };
+  for (const bookmark of bookmarks) bump(bookmark.parentId);
+  for (const folder of folders) bump(folder.parentId);
+  return counts;
+}
+
+async function analyzeBookmarkOrganize(scope?: BookmarkOrganizeScope): Promise<
+  | { granted: false }
+  | {
+    granted: true
+    proposal: BookmarkOrganizeProposal
+    source: 'topic-model' | 'host-heuristic'
+    provider: ProviderCapabilities['name']
+    analyzedCount: number
+    eligibleCount: number
+  }
+> {
+  await mutationQueue;
+  if (!(await hasBookmarksPermission())) return { granted: false };
+  const { bookmarks, folders } = flattenBookmarkTree(await chrome.bookmarks.getTree());
+  const canCloud = settings.aiProvider === 'openai-compatible' && Boolean(cloudApiKey) && await hasCloudPermission();
+  const limit = canCloud ? BOOKMARK_ORGANIZE_CLOUD_LIMIT : BOOKMARK_ORGANIZE_LOCAL_LIMIT;
+  const { eligible, analyzed } = selectAnalyzeBookmarks(bookmarks, folders, scope, limit);
+  const host = proposeBookmarkOrganize({ bookmarks, folders, scope });
+
+  if (canCloud) {
+    const payload = buildTopicAnalyzePayload(analyzed, folders, settings.language, scope);
+    const raw = await requestTopicOrganizeJson(payload, 'openai-compatible', settings, cloudApiKey);
+    const topic = topicProposalFromModel(raw, bookmarks, folders, scope);
+    if (!topic.clusters.length) {
+      return { granted: true, proposal: host, source: 'host-heuristic', provider: 'heuristic', analyzedCount: analyzed.length, eligibleCount: eligible.length };
+    }
+    return {
+      granted: true,
+      proposal: mergeTopicWithHostOrganize(topic, bookmarks, folders, scope),
+      source: 'topic-model',
+      provider: 'openai-compatible',
+      analyzedCount: analyzed.length,
+      eligibleCount: eligible.length,
+    };
+  }
+
+  const payload = buildTopicAnalyzePayload(analyzed, folders, settings.language);
+  const raw = await requestTopicOrganizeJson(payload, 'local-model', settings, '');
+  const topic = topicProposalFromModel(raw, bookmarks, folders, scope);
+  if (topic.clusters.length) {
+    return {
+      granted: true,
+      proposal: mergeTopicWithHostOrganize(topic, bookmarks, folders, scope),
+      source: 'topic-model',
+      provider: 'local-model',
+      analyzedCount: analyzed.length,
+      eligibleCount: eligible.length,
+    };
+  }
+
+  return { granted: true, proposal: host, source: 'host-heuristic', provider: 'heuristic', analyzedCount: 0, eligibleCount: eligible.length };
+}
+
+async function restoreBookmarkOrganize(snapshotId: string): Promise<{
+  moved: number
+  skipped: number
+  deletedFolders: number
+}> {
+  await requireBookmarksPermission();
+  const snapshots = await loadBookmarkOrganizeSnapshots();
+  const snapshot = snapshots.find((item) => item.id === snapshotId);
+  if (!snapshot || snapshot.expiresAt <= Date.now()) {
+    throw new Error('That organize snapshot is no longer available.');
+  }
+
+  const flattened = flattenBookmarkTree(await chrome.bookmarks.getTree());
+  const folderChildCounts = folderChildCountsFromFlatten(flattened.bookmarks, flattened.folders);
+  const plan = planBookmarkOrganizeRestore(snapshot, flattened.bookmarks, flattened.folders, folderChildCounts);
+
+  return runBookmarkBatch(async () => {
+    let moved = 0;
+    let skipped = plan.skipped;
+    for (const node of plan.moves) {
+      try {
+        const live = (await chrome.bookmarks.get(node.id))[0];
+        if (!live) {
+          skipped += 1;
+          continue;
+        }
+        const index = live.parentId === node.parentId
+          ? bookmarkMoveIndex({
+            fromIndex: live.index ?? 0,
+            targetIndex: node.index,
+            placement: 'before',
+            sameParent: true,
+          })
+          : node.index;
+        await chrome.bookmarks.move(node.id, { parentId: node.parentId, index });
+        moved += 1;
+      } catch {
+        skipped += 1;
+      }
+    }
+
+    const deletedFolders = await removeEmptyCreatedOrganizeFolders(snapshot.createdFolderIds);
+
+    await deleteBookmarkOrganizeSnapshot(snapshot.id);
+    await clearLastAction();
+    lastAction = undefined;
+    snapshotDirty = true;
+    return { moved, skipped, deletedFolders };
+  });
+}
+
+async function getBookmarkOrganizeSnapshots() {
+  const snapshots = await loadBookmarkOrganizeSnapshots();
+  return snapshots.map(toBookmarkOrganizeSnapshotSummary);
+}
+
 async function fileBookmarks(bookmarkIds: string[], folderId: string): Promise<{ moved: number }> {
+  await requireBookmarksPermission();
+  const folders = flattenBookmarkTree(await chrome.bookmarks.getTree()).folders;
+  assertFileableBookmarkParent(folderId, folders);
   const uniqueIds = [...new Set(bookmarkIds)];
   const moves = await Promise.all(uniqueIds.map(async (id) => {
     const node = (await chrome.bookmarks.get(id))[0];
@@ -374,6 +877,7 @@ async function fileBookmarks(bookmarkIds: string[], folderId: string): Promise<{
 }
 
 async function applyBookmarkDedup(groups: Array<{ keepId: string; removeIds: string[] }>): Promise<{ removed: number }> {
+  await requireBookmarksPermission();
   const live = flattenBookmarkTree(await chrome.bookmarks.getTree()).bookmarks;
   const validatedGroups = validateBookmarkDedupGroups(live, groups);
   const keepIds = new Set(validatedGroups.map((group) => group.keepId));
@@ -431,7 +935,8 @@ async function bookmarkSuggestion(bookmarkId: string): Promise<{
 async function handleCreatedBookmark(bookmarkId: string): Promise<void> {
   await initialize();
   const result = await bookmarkSuggestion(bookmarkId);
-  if (!result?.bookmark.isInbox) return;
+  if (!result) return;
+  if (decideCreatedBookmarkAction({ isInbox: result.bookmark.isInbox }) === 'ignore') return;
   const { bookmark, suggestion } = result;
   const event: Extract<ZenTabEvent, { type: 'BOOKMARK_FILING_SUGGESTED' }> = {
     type: 'BOOKMARK_FILING_SUGGESTED',
@@ -443,21 +948,6 @@ async function handleCreatedBookmark(bookmarkId: string): Promise<void> {
   const sidePanelOpen = await chrome.runtime.getContexts({ contextTypes: [chrome.runtime.ContextType.SIDE_PANEL] })
     .then((contexts) => contexts.length > 0)
     .catch(() => false);
-  if (suggestion?.confidence === 'high' && sidePanelOpen) {
-    const result = await fileBookmarks([bookmark.id], suggestion.folderId);
-    sendEvent({
-      type: 'TOAST',
-      toast: {
-        id: lastAction?.actionId ?? createId('toast'),
-        tone: result.moved > 0 ? 'success' : 'neutral',
-        message: settings.language === 'zh'
-          ? `书签已归档到 ${suggestion.folderTitle}。`
-          : `Bookmark filed in ${suggestion.folderTitle}.`,
-        ...(result.moved > 0 ? { action: 'undo' as const } : {}),
-      },
-    });
-    return;
-  }
   if (sidePanelOpen) sendEvent(event);
   else await chrome.storage.session.set({ [PENDING_BOOKMARK_FILING_KEY]: event });
 }
@@ -740,6 +1230,8 @@ async function groupSelectedTabs(windowId: number, requestedIds: number[], title
 async function createBookmarksFromTabs(folderId: string | undefined, tabs: Array<{ title: string; url: string }>): Promise<{ created: number; skipped: number }> {
   if (!(await hasBookmarksPermission())) throw new Error('Bookmark access is required to file these tabs.');
   const flattened = flattenBookmarkTree(await chrome.bookmarks.getTree());
+  const dest = folderId ? flattened.folders.find((folder) => folder.id === folderId) : undefined;
+  if (folderId) assertFileableBookmarkParent(folderId, flattened.folders);
   const existing = existingCanonicalUrlsInBookmarkParent(flattened.bookmarks, flattened.folders, folderId);
   const { toCreate, skipped } = planBookmarkCreates(tabs, existing);
   const created: Array<{ id: string }> = [];
@@ -754,28 +1246,30 @@ async function createBookmarksFromTabs(folderId: string | undefined, tabs: Array
       expiresAt: Date.now() + 30_000,
     });
   };
+  const createNodes = async () => {
+    await runBookmarkBatch(async () => {
+      try {
+        for (const tab of toCreate) {
+          const node = await chrome.bookmarks.create({
+            ...(folderId ? { parentId: folderId } : {}),
+            title: tab.title,
+            url: tab.url,
+          });
+          created.push({ id: node.id });
+        }
+      } catch (error) {
+        await persistCreated();
+        throw error;
+      }
+    });
+    await persistCreated();
+    return { created: created.length, skipped };
+  };
+  if (!shouldSuppressCreatedBookmarkFiling(dest)) return createNodes();
   return withBookmarkCreatedFilingSuppressed(
     toCreate.length,
     (delta) => { suppressBookmarkCreatedFiling += delta; },
-    async () => {
-      await runBookmarkBatch(async () => {
-        try {
-          for (const tab of toCreate) {
-            const node = await chrome.bookmarks.create({
-              ...(folderId ? { parentId: folderId } : {}),
-              title: tab.title,
-              url: tab.url,
-            });
-            created.push({ id: node.id });
-          }
-        } catch (error) {
-          await persistCreated();
-          throw error;
-        }
-      });
-      await persistCreated();
-      return { created: created.length, skipped };
-    },
+    createNodes,
   );
 }
 
@@ -927,7 +1421,15 @@ async function listRecentSessions(): Promise<RecentSession[]> {
       const title = session.window.tabs?.find((tab) => tab.active)?.title || tabs[0]?.title || 'Closed window';
       return [{ sessionId, lastModified: session.lastModified ?? 0, title, tabCount: tabs.length, kind: 'window' }];
     }
-    return [{ sessionId, lastModified: session.lastModified ?? 0, title: session.tab?.title || session.tab?.url || 'Closed tab', tabCount: 1, kind: 'tab' }];
+    return [{
+      sessionId,
+      lastModified: session.lastModified ?? 0,
+      title: session.tab?.title || session.tab?.url || 'Closed tab',
+      tabCount: 1,
+      kind: 'tab',
+      url: session.tab?.url,
+      favIconUrl: session.tab?.favIconUrl,
+    }];
   });
 }
 
@@ -1108,13 +1610,18 @@ async function restoreAction(): Promise<boolean> {
     tabs?: TabRestoreDescriptor[];
     ungroupTabIds?: number[];
     group?: GroupUndoData;
-    kind?: 'duplicate' | 'file' | 'dedup' | 'create';
+    kind?: 'duplicate' | 'file' | 'dedup' | 'create' | 'move' | 'edit' | 'folder-create';
     newTab?: TabRestoreDescriptor;
     candidate?: DuplicateUndoData['candidate'];
     incognito?: boolean;
-    moves?: Extract<BookmarkUndoData, { kind: 'file' }>['moves'];
+    id?: string;
+    previousTitle?: string;
+    previousUrl?: string;
+    moves?: BookmarkFileMove[] | BookmarkIndexMove[];
     removed?: Extract<BookmarkUndoData, { kind: 'dedup' }>['removed'];
     created?: Extract<BookmarkUndoData, { kind: 'create' }>['created'];
+    organizeSnapshotId?: string;
+    createdFolderIds?: string[];
   } | undefined;
   if (lastAction.type === 'stash' && data?.tabs?.length) {
     const result = await restoreDescriptors(data.tabs, data.tabs[0].windowId, true, undefined, Boolean(data.incognito));
@@ -1173,24 +1680,106 @@ async function restoreAction(): Promise<boolean> {
   }
   if (lastAction.type === 'bookmark' && data?.kind === 'file' && data.moves?.length) {
     const action = lastAction;
-    const remaining = [...data.moves];
+    const remaining = [...data.moves] as BookmarkFileMove[];
+    const organizeSnapshotId = data.organizeSnapshotId;
+    let createdFolderIds = data.createdFolderIds ?? [];
+    if (!createdFolderIds.length && organizeSnapshotId) {
+      try {
+        const snapshots = await loadBookmarkOrganizeSnapshots();
+        createdFolderIds = snapshots.find((item) => item.id === organizeSnapshotId)?.createdFolderIds ?? [];
+      } catch {
+        createdFolderIds = [];
+      }
+    }
+    const fileCheckpoint = (moves: BookmarkFileMove[]) => checkpointBookmarkUndo(action, {
+      kind: 'file',
+      moves,
+      organizeSnapshotId,
+      ...(createdFolderIds.length ? { createdFolderIds } : {}),
+    });
     return runBookmarkBatch(async () => {
       while (remaining.length) {
         const move = remaining[0];
         try {
-          const liveNode = (await chrome.bookmarks.get(move.id))[0];
+          let liveNode: chrome.bookmarks.BookmarkTreeNode | undefined;
+          try {
+            liveNode = (await chrome.bookmarks.get(move.id))[0];
+          } catch {
+            remaining.shift();
+            await fileCheckpoint([...remaining]);
+            continue;
+          }
           if (shouldRestoreFiledBookmark(move, liveNode)) {
             await chrome.bookmarks.move(move.id, { parentId: move.fromParentId, index: move.fromIndex });
           }
           remaining.shift();
-          await checkpointBookmarkUndo(action, { kind: 'file', moves: [...remaining] });
+          await fileCheckpoint([...remaining]);
         } catch (error) {
-          await checkpointBookmarkUndo(action, { kind: 'file', moves: [...remaining] });
+          await fileCheckpoint([...remaining]);
+          throw error;
+        }
+      }
+      await removeEmptyCreatedOrganizeFolders(createdFolderIds);
+      if (organizeSnapshotId) await deleteBookmarkOrganizeSnapshot(organizeSnapshotId);
+      return true;
+    });
+  }
+  if (lastAction.type === 'bookmark' && data?.kind === 'move' && data.moves?.length) {
+    const action = lastAction;
+    const remaining = [...data.moves] as BookmarkIndexMove[];
+    return runBookmarkBatch(async () => {
+      while (remaining.length) {
+        const move = remaining[0];
+        try {
+          let liveNode: chrome.bookmarks.BookmarkTreeNode | undefined;
+          try {
+            liveNode = (await chrome.bookmarks.get(move.id))[0];
+          } catch {
+            remaining.shift();
+            await checkpointBookmarkUndo(action, { kind: 'move', moves: [...remaining] });
+            continue;
+          }
+          if (shouldRestoreMovedBookmark(move, liveNode)) {
+            await chrome.bookmarks.move(move.id, { parentId: move.fromParentId, index: move.fromIndex });
+          }
+          remaining.shift();
+          await checkpointBookmarkUndo(action, { kind: 'move', moves: [...remaining] });
+        } catch (error) {
+          await checkpointBookmarkUndo(action, { kind: 'move', moves: [...remaining] });
           throw error;
         }
       }
       return true;
     });
+  }
+  if (lastAction.type === 'bookmark' && data?.kind === 'edit' && data.id) {
+    try {
+      const liveNode = (await chrome.bookmarks.get(data.id))[0];
+      if (liveNode) {
+        await runBookmarkBatch(() => chrome.bookmarks.update(data.id!, {
+          title: data.previousTitle ?? liveNode.title,
+          ...(data.previousUrl !== undefined ? { url: data.previousUrl } : {}),
+        }));
+      }
+    } catch {
+      // Missing nodes skip undo.
+    }
+    await clearLastAction();
+    lastAction = undefined;
+    return true;
+  }
+  if (lastAction.type === 'bookmark' && data?.kind === 'folder-create' && data.id) {
+    try {
+      const children = await chrome.bookmarks.getChildren(data.id);
+      if (!children.length) {
+        await runBookmarkBatch(() => chrome.bookmarks.remove(data.id!));
+      }
+    } catch {
+      // Missing or non-empty folders skip undo.
+    }
+    await clearLastAction();
+    lastAction = undefined;
+    return true;
   }
   if (lastAction.type === 'bookmark' && data?.kind === 'create' && data.created?.length) {
     const action = lastAction;
@@ -1371,16 +1960,38 @@ async function handleMessage(message: ZenTabMessage): Promise<unknown> {
       return getBookmarkTreeData();
     case 'FILE_BOOKMARKS':
       return fileBookmarks(message.bookmarkIds, message.folderId);
+    case 'APPLY_BOOKMARK_FILING':
+      return applyBookmarkFiling(message.creates, message.moves);
+    case 'APPLY_BOOKMARK_ORGANIZE':
+      return applyBookmarkOrganize(message.creates, message.moves, message.scope);
+    case 'ANALYZE_BOOKMARK_ORGANIZE':
+      return analyzeBookmarkOrganize(message.scope);
+    case 'RESTORE_BOOKMARK_ORGANIZE':
+      return restoreBookmarkOrganize(message.snapshotId);
+    case 'GET_BOOKMARK_ORGANIZE_SNAPSHOTS':
+      return getBookmarkOrganizeSnapshots();
     case 'APPLY_BOOKMARK_DEDUP':
       return applyBookmarkDedup(message.groups);
     case 'SUGGEST_BOOKMARK_FILE':
-      return (await bookmarkSuggestion(message.bookmarkId))?.suggestion ?? null;
+      return bookmarkSuggestion(message.bookmarkId);
     case 'RUN_GROUP_ANALYSIS':
       return prepareGroupInputs(message.windowId, Boolean(message.deepScanAll), message.tabIds);
     case 'GROUP_TABS':
       return groupSelectedTabs(message.windowId, message.tabIds, message.title, message.color);
     case 'CREATE_BOOKMARKS':
       return createBookmarksFromTabs(message.folderId, message.tabs);
+    case 'UPDATE_BOOKMARK':
+      return updateBookmark(message.id, message.title, message.url);
+    case 'REMOVE_BOOKMARK':
+      return removeBookmark(message.id);
+    case 'CREATE_BOOKMARK_FOLDER':
+      return createBookmarkFolder(message.parentId, message.title);
+    case 'REMOVE_BOOKMARK_FOLDER':
+      return removeBookmarkFolder(message.id);
+    case 'MOVE_BOOKMARK':
+      return moveBookmark(message.id, message.parentId, message.index);
+    case 'OPEN_BOOKMARK_URLS':
+      return openBookmarkUrls(message.urls);
     case 'APPLY_GROUP_PROPOSAL':
       return applyGroupProposal(message.proposal);
     case 'RUN_CLEANUP_ANALYSIS':
@@ -1459,7 +2070,8 @@ async function handleMessage(message: ZenTabMessage): Promise<unknown> {
       await refreshWindowTabIndexes(message.windowId);
       return { moved: true };
     case 'GROUP_TAB':
-      if (message.groupId !== -1) await chrome.tabs.group({ tabIds: [message.tabId], groupId: message.groupId });
+      if (message.groupId === -1) await chrome.tabs.ungroup(message.tabId).catch(() => undefined);
+      else await chrome.tabs.group({ tabIds: [message.tabId], groupId: message.groupId });
       return { grouped: true };
     case 'UPDATE_GROUP':
       return updateGroup(message.groupId, message.action, message.title, message.color, message.collapsed);
@@ -1486,10 +2098,18 @@ async function handleMessage(message: ZenTabMessage): Promise<unknown> {
 
 function isMutationMessage(message: ZenTabMessage): boolean {
   return message.type === 'FILE_BOOKMARKS'
+    || message.type === 'APPLY_BOOKMARK_FILING'
+    || message.type === 'APPLY_BOOKMARK_ORGANIZE'
+    || message.type === 'RESTORE_BOOKMARK_ORGANIZE'
     || message.type === 'APPLY_BOOKMARK_DEDUP'
-    || message.type === 'SUGGEST_BOOKMARK_FILE'
     || message.type === 'GROUP_TABS'
     || message.type === 'CREATE_BOOKMARKS'
+    || message.type === 'UPDATE_BOOKMARK'
+    || message.type === 'REMOVE_BOOKMARK'
+    || message.type === 'CREATE_BOOKMARK_FOLDER'
+    || message.type === 'REMOVE_BOOKMARK_FOLDER'
+    || message.type === 'MOVE_BOOKMARK'
+    || message.type === 'OPEN_BOOKMARK_URLS'
     || message.type === 'APPLY_GROUP_PROPOSAL'
     || message.type === 'APPLY_CLEANUP'
     || message.type === 'STASH'
@@ -1618,28 +2238,42 @@ chrome.tabGroups.onRemoved.addListener((group) => {
 
 let bookmarkListenersBound = false;
 
+function onBookmarkCreated(id: string, node: chrome.bookmarks.BookmarkTreeNode) {
+  scheduleBookmarksUpdated();
+  if (!node.url || shouldIgnoreBookmarkCreated(suppressBookmarkCreatedFiling)) return;
+  void runMutation(() => handleCreatedBookmark(id)).catch(() => undefined);
+}
+
+function scheduleBookmarksFromListener() {
+  scheduleBookmarksUpdated();
+}
+
 function bindBookmarkListeners() {
   if (bookmarkListenersBound || !canUseBookmarksApi(chrome.bookmarks)) return;
   bookmarkListenersBound = true;
-  chrome.bookmarks.onCreated.addListener((id, node) => {
-    scheduleBookmarksUpdated();
-    if (!node.url || shouldIgnoreBookmarkCreated(suppressBookmarkCreatedFiling)) return;
-    void runMutation(() => handleCreatedBookmark(id)).catch(() => undefined);
-  });
-  chrome.bookmarks.onChanged.addListener(() => {
-    scheduleBookmarksUpdated();
-  });
-  chrome.bookmarks.onMoved.addListener(() => {
-    scheduleBookmarksUpdated();
-  });
-  chrome.bookmarks.onRemoved.addListener(() => {
-    scheduleBookmarksUpdated();
-  });
+  chrome.bookmarks.onCreated.addListener(onBookmarkCreated);
+  chrome.bookmarks.onChanged.addListener(scheduleBookmarksFromListener);
+  chrome.bookmarks.onMoved.addListener(scheduleBookmarksFromListener);
+  chrome.bookmarks.onRemoved.addListener(scheduleBookmarksFromListener);
+}
+
+function unbindBookmarkListeners() {
+  bookmarkListenersBound = false;
+  if (!canUseBookmarksApi(chrome.bookmarks)) return;
+  chrome.bookmarks.onCreated.removeListener(onBookmarkCreated);
+  chrome.bookmarks.onChanged.removeListener(scheduleBookmarksFromListener);
+  chrome.bookmarks.onMoved.removeListener(scheduleBookmarksFromListener);
+  chrome.bookmarks.onRemoved.removeListener(scheduleBookmarksFromListener);
 }
 
 bindBookmarkListeners();
 chrome.permissions?.onAdded?.addListener((granted) => {
   if (granted.permissions?.includes('bookmarks')) bindBookmarkListeners();
+});
+chrome.permissions?.onRemoved?.addListener((removed) => {
+  if (!removed.permissions?.includes('bookmarks')) return;
+  unbindBookmarkListeners();
+  sendEvent({ type: 'BOOKMARKS_UPDATED' });
 });
 
 chrome.runtime.onStartup.addListener(() => {

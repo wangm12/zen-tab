@@ -56,6 +56,51 @@ export function getHostname(rawUrl: string): string {
   }
 }
 
+const TWO_LEVEL_PUBLIC_SUFFIXES = new Set([
+  'co.uk',
+  'com.cn',
+  'net.cn',
+  'org.cn',
+  'edu.cn',
+  'gov.cn',
+  'co.jp',
+  'ne.jp',
+  'com.au',
+  'net.au',
+  'org.au',
+  'co.nz',
+  'net.nz',
+  'org.nz',
+  'com.tw',
+  'org.tw',
+  'com.hk',
+  'org.hk',
+  'com.sg',
+  'co.in',
+  'com.br',
+  'github.io',
+  'gitlab.io',
+  'pages.dev',
+  'vercel.app',
+  'netlify.app',
+]);
+
+export function rootDomainFromHost(host: string): string {
+  const cleaned = host.trim().toLowerCase().replace(/^www\./, '');
+  if (!cleaned) return '';
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(cleaned) || cleaned.includes(':')) {
+    return cleaned;
+  }
+  const parts = cleaned.split('.').filter(Boolean);
+  if (parts.length <= 2) return cleaned;
+
+  const lastTwo = parts.slice(-2).join('.');
+  if (TWO_LEVEL_PUBLIC_SUFFIXES.has(lastTwo)) {
+    return parts.slice(-3).join('.');
+  }
+  return parts.slice(-2).join('.');
+}
+
 export function isLocalAddress(rawUrl: string): boolean {
   const hostname = getHostname(rawUrl);
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0' || hostname.endsWith('.local');

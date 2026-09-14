@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zen Tab - Privacy Policy</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      line-height: 1.6;
+      color: #333;
+      max-width: 800px;
+      margin: 40px auto;
+      padding: 0 20px;
+    }
+    h1, h2, h3 { color: #111; }
+    code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>Privacy Policy for Zen Tab</h1>
+  <p><strong>Last Updated:</strong> September 2026</p>
+
+  <h2>Overview</h2>
+  <p>Zen Tab ("we", "our", or "the extension") is a Manifest V3 Chrome extension designed to provide a calm, fast workspace for organizing and managing browser tabs. We believe your browsing activity is private and should remain strictly on your local device.</p>
+
+  <h2>Data Collection and Usage</h2>
+  <p>Zen Tab is strictly <strong>local-first</strong>:</p>
+  <ul>
+    <li><strong>No Remote Data Collection:</strong> We do not track, collect, store, transmit, or sell any personal data, browsing history, URLs, or tab content to any remote server or third party.</li>
+    <li><strong>Local Storage:</strong> All user settings, tab stashes, and workspace preferences are stored exclusively on your device using Chrome's built-in <code>chrome.storage.local</code> API.</li>
+    <li><strong>Optional AI Features:</strong> Tab organization works entirely locally without AI. If you choose to enable AI grouping via Groq, requests are sent using your own API key (Bring Your Own Key) directly to the provider. No intermediate servers are involved.</li>
+  </ul>
+
+  <h2>Chrome Permissions</h2>
+  <ul>
+    <li><code>tabs</code> and <code>tabGroups</code>: Used to display and manage your open tabs in the side panel.</li>
+    <li><code>sidePanel</code>: Used to render the workspace user interface.</li>
+    <li><code>storage</code>: Used to save your settings and stashed tab sessions locally.</li>
+    <li><code>sessions</code> & <code>alarms</code>: Used for safe session recovery and scheduled memory maintenance.</li>
+  </ul>
+
+  <h2>Contact</h2>
+  <p>If you have any questions or feedback regarding this Privacy Policy, please open an issue on our GitHub repository: <a href="https://github.com/wangm12/zen-tab">https://github.com/wangm12/zen-tab</a>.</p>
+</body>
+</html>
