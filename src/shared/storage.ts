@@ -1,11 +1,18 @@
 import {
+  BOOKMARK_ORGANIZE_SNAPSHOTS_JSON_LIMIT,
+  pruneBookmarkOrganizeSnapshots,
+} from './bookmark-organize';
+import {
   ActionJournal,
+  BookmarkOrganizeSnapshot,
   DEFAULT_SETTINGS,
   StashRecord,
   StashedTab,
   ProjectMemoryRule,
   ZenTabSettings,
+  AutoDiscardMinutes,
 } from './types';
+import { DEFAULT_GROQ_BASE_URL, DEFAULT_OPENAI_MODEL, normalizeOpenAiBaseUrl } from './openai';
 
 const SETTINGS_KEY = 'zen-tab.settings';
 const STASHES_KEY = 'zen-tab.stashes';
@@ -16,6 +23,7 @@ const LEGACY_STASHES_KEY = 'tab-flow.stashes';
 const LEGACY_ACTION_KEY = 'tab-flow.last-action';
 const LEGACY_GROQ_KEY = 'tab-flow.groq-key';
 const PROJECT_MEMORY_KEY = 'zen-tab.project-memory';
+export const BOOKMARK_ORGANIZE_SNAPSHOTS_KEY = 'zen-tab.bookmark-organize-snapshots';
 const MAX_PROJECT_MEMORY_RULES = 100;
 const MAX_PROJECT_MEMORY_TOKEN_LENGTH = 80;
 const MAX_PROJECT_MEMORY_JSON_LENGTH = 1_000_000;
@@ -79,7 +87,7 @@ function normalizeStash(value: unknown): StashRecord | null {
 function isActionJournal(value: unknown): value is ActionJournal {
   if (!isRecord(value)) return false;
   return typeof value.actionId === 'string'
-    && (value.type === 'duplicate' || value.type === 'group' || value.type === 'cleanup' || value.type === 'stash')
+    && (value.type === 'duplicate' || value.type === 'group' || value.type === 'cleanup' || value.type === 'stash' || value.type === 'close' || value.type === 'bookmark')
     && typeof value.createdAt === 'number'
     && Array.isArray(value.affectedTabIds)
     && value.affectedTabIds.every((tabId) => typeof tabId === 'number')
@@ -108,9 +116,20 @@ function normalizeProjectMemory(value: unknown): ProjectMemoryRule[] {
   return rules.sort((left, right) => right.updatedAt - left.updatedAt).slice(0, MAX_PROJECT_MEMORY_RULES);
 }
 
-export async function loadSettings(): Promise<ZenTabSettings> {
-  const stored = await readStorageKey<unknown>(SETTINGS_KEY, LEGACY_SETTINGS_KEY);
+function autoDiscardMinutes(value: unknown): AutoDiscardMinutes {
+  return value === 15 || value === 30 || value === 60 || value === 120 ? value : DEFAULT_SETTINGS.autoDiscardMinutes;
+}
+
+function settingsFromStored(stored: unknown): ZenTabSettings {
   const safeSettings = isRecord(stored) ? stored : {};
+  const migratedProvider = safeSettings.aiProvider === 'groq' || safeSettings.aiProvider === 'openai-compatible'
+    ? 'openai-compatible' as const
+    : DEFAULT_SETTINGS.aiProvider;
+  const openaiModel = typeof safeSettings.openaiModel === 'string' && safeSettings.openaiModel.trim()
+    ? safeSettings.openaiModel.trim()
+    : typeof safeSettings.groqModel === 'string' && safeSettings.groqModel.trim()
+      ? safeSettings.groqModel.trim()
+      : DEFAULT_OPENAI_MODEL;
   return {
     ...DEFAULT_SETTINGS,
     duplicateEnabled: typeof safeSettings.duplicateEnabled === 'boolean' ? safeSettings.duplicateEnabled : DEFAULT_SETTINGS.duplicateEnabled,
@@ -118,11 +137,71 @@ export async function loadSettings(): Promise<ZenTabSettings> {
     ignoredDomains: stringArray(safeSettings.ignoredDomains, DEFAULT_SETTINGS.ignoredDomains),
     protectedDomains: stringArray(safeSettings.protectedDomains, DEFAULT_SETTINGS.protectedDomains),
     deepAnalysisEnabled: typeof safeSettings.deepAnalysisEnabled === 'boolean' ? safeSettings.deepAnalysisEnabled : DEFAULT_SETTINGS.deepAnalysisEnabled,
-    aiProvider: safeSettings.aiProvider === 'groq' ? 'groq' : DEFAULT_SETTINGS.aiProvider,
-    groqModel: typeof safeSettings.groqModel === 'string' && safeSettings.groqModel.trim() ? safeSettings.groqModel.trim() : DEFAULT_SETTINGS.groqModel,
+    aiProvider: migratedProvider,
+    openaiBaseUrl: typeof safeSettings.openaiBaseUrl === 'string' ? normalizeOpenAiBaseUrl(safeSettings.openaiBaseUrl) : DEFAULT_GROQ_BASE_URL,
+    openaiModel,
+    autoDiscardEnabled: typeof safeSettings.autoDiscardEnabled === 'boolean' ? safeSettings.autoDiscardEnabled : DEFAULT_SETTINGS.autoDiscardEnabled,
+    autoDiscardMinutes: autoDiscardMinutes(safeSettings.autoDiscardMinutes),
+    autoDiscardInspectPages: typeof safeSettings.autoDiscardInspectPages === 'boolean' ? safeSettings.autoDiscardInspectPages : DEFAULT_SETTINGS.autoDiscardInspectPages,
     incognitoEnabled: typeof safeSettings.incognitoEnabled === 'boolean' ? safeSettings.incognitoEnabled : DEFAULT_SETTINGS.incognitoEnabled,
     language: safeSettings.language === 'zh' ? 'zh' : 'en',
     theme: safeSettings.theme === 'light' || safeSettings.theme === 'dark' ? safeSettings.theme : 'system',
+    atmosphereEnabled: typeof safeSettings.atmosphereEnabled === 'boolean' ? safeSettings.atmosphereEnabled : DEFAULT_SETTINGS.atmosphereEnabled,
+  };
+}
+
+function stashesFromStored(stored: unknown): StashRecord[] {
+  return Array.isArray(stored) ? stored.map(normalizeStash).filter((stash): stash is StashRecord => Boolean(stash)).slice(0, 50) : [];
+}
+
+function apiKeyFromStored(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+export async function loadSettings(): Promise<ZenTabSettings> {
+  return settingsFromStored(await readStorageKey<unknown>(SETTINGS_KEY, LEGACY_SETTINGS_KEY));
+}
+
+export async function loadWorkerBootstrap(
+  read: (keys: string[]) => Promise<Record<string, unknown>> = (keys) => chrome.storage.local.get(keys),
+): Promise<{
+  settings: ZenTabSettings;
+  lastAction: ActionJournal | undefined;
+  stashes: StashRecord[];
+  projectMemory: ProjectMemoryRule[];
+  cloudApiKey: string;
+}> {
+  const result = await read([
+    SETTINGS_KEY, LEGACY_SETTINGS_KEY,
+    STASHES_KEY, LEGACY_STASHES_KEY,
+    ACTION_KEY, LEGACY_ACTION_KEY,
+    GROQ_KEY, LEGACY_GROQ_KEY,
+    PROJECT_MEMORY_KEY,
+  ]);
+  const migrations: Record<string, unknown> = {};
+  const pick = (key: string, legacyKey: string) => {
+    if (result[key] !== undefined) return result[key];
+    if (result[legacyKey] !== undefined) {
+      migrations[key] = result[legacyKey];
+      return result[legacyKey];
+    }
+    return undefined;
+  };
+  const settings = settingsFromStored(pick(SETTINGS_KEY, LEGACY_SETTINGS_KEY));
+  const storedAction = pick(ACTION_KEY, LEGACY_ACTION_KEY);
+  const lastAction = isActionJournal(storedAction) ? storedAction : undefined;
+  const stashes = stashesFromStored(pick(STASHES_KEY, LEGACY_STASHES_KEY));
+  const projectMemory = normalizeProjectMemory(result[PROJECT_MEMORY_KEY]);
+  const cloudApiKey = apiKeyFromStored(pick(GROQ_KEY, LEGACY_GROQ_KEY));
+  if (Object.keys(migrations).length) {
+    try { void chrome.storage.local.set(migrations); } catch { /* First paint can read legacy keys without writing them back. */ }
+  }
+  return {
+    settings,
+    lastAction,
+    stashes,
+    projectMemory: JSON.stringify(projectMemory).length <= MAX_PROJECT_MEMORY_JSON_LENGTH ? projectMemory : [],
+    cloudApiKey,
   };
 }
 
@@ -131,8 +210,7 @@ export async function saveSettings(settings: ZenTabSettings): Promise<void> {
 }
 
 export async function loadGroqApiKey(): Promise<string> {
-  const value = await readStorageKey<unknown>(GROQ_KEY, LEGACY_GROQ_KEY);
-  return typeof value === 'string' ? value : '';
+  return apiKeyFromStored(await readStorageKey<unknown>(GROQ_KEY, LEGACY_GROQ_KEY));
 }
 
 export async function saveGroqApiKey(apiKey: string): Promise<void> {
@@ -141,8 +219,7 @@ export async function saveGroqApiKey(apiKey: string): Promise<void> {
 }
 
 export async function listStashes(): Promise<StashRecord[]> {
-  const stored = await readStorageKey<unknown>(STASHES_KEY, LEGACY_STASHES_KEY);
-  return Array.isArray(stored) ? stored.map(normalizeStash).filter((stash): stash is StashRecord => Boolean(stash)).slice(0, 50) : [];
+  return stashesFromStored(await readStorageKey<unknown>(STASHES_KEY, LEGACY_STASHES_KEY));
 }
 
 export async function saveStash(stash: StashRecord): Promise<void> {
@@ -190,6 +267,62 @@ export async function saveProjectMemory(rules: ProjectMemoryRule[]): Promise<voi
 
 export async function clearProjectMemory(): Promise<void> {
   await chrome.storage.local.remove(PROJECT_MEMORY_KEY);
+}
+
+function normalizeBookmarkOrganizeNode(value: unknown): BookmarkOrganizeSnapshot['nodes'][number] | null {
+  if (!isRecord(value) || typeof value.id !== 'string' || typeof value.parentId !== 'string' || typeof value.index !== 'number' || !Number.isFinite(value.index)) {
+    return null;
+  }
+  return { id: value.id, parentId: value.parentId, index: value.index };
+}
+
+function normalizeBookmarkOrganizeSnapshots(value: unknown): BookmarkOrganizeSnapshot[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): BookmarkOrganizeSnapshot[] => {
+    if (
+      !isRecord(item)
+      || typeof item.id !== 'string'
+      || typeof item.createdAt !== 'number'
+      || !Number.isFinite(item.createdAt)
+      || typeof item.expiresAt !== 'number'
+      || !Number.isFinite(item.expiresAt)
+      || !Array.isArray(item.nodes)
+    ) return [];
+    return [{
+      id: item.id,
+      createdAt: item.createdAt,
+      expiresAt: item.expiresAt,
+      moveCount: typeof item.moveCount === 'number' && Number.isFinite(item.moveCount) ? item.moveCount : 0,
+      createdFolderIds: Array.isArray(item.createdFolderIds)
+        ? item.createdFolderIds.filter((folderId): folderId is string => typeof folderId === 'string')
+        : [],
+      nodes: item.nodes.flatMap((node) => {
+        const normalized = normalizeBookmarkOrganizeNode(node);
+        return normalized ? [normalized] : [];
+      }),
+    }];
+  });
+}
+
+export async function loadBookmarkOrganizeSnapshots(): Promise<BookmarkOrganizeSnapshot[]> {
+  const result = await chrome.storage.local.get(BOOKMARK_ORGANIZE_SNAPSHOTS_KEY);
+  return pruneBookmarkOrganizeSnapshots(
+    normalizeBookmarkOrganizeSnapshots(result[BOOKMARK_ORGANIZE_SNAPSHOTS_KEY]),
+    Date.now(),
+  );
+}
+
+export async function saveBookmarkOrganizeSnapshots(snapshots: BookmarkOrganizeSnapshot[]): Promise<void> {
+  const next = pruneBookmarkOrganizeSnapshots(normalizeBookmarkOrganizeSnapshots(snapshots), Date.now());
+  if (JSON.stringify(next).length > BOOKMARK_ORGANIZE_SNAPSHOTS_JSON_LIMIT) {
+    throw new Error('Organize snapshots are too large.');
+  }
+  await chrome.storage.local.set({ [BOOKMARK_ORGANIZE_SNAPSHOTS_KEY]: next });
+}
+
+export async function deleteBookmarkOrganizeSnapshot(id: string): Promise<void> {
+  const snapshots = await loadBookmarkOrganizeSnapshots();
+  await saveBookmarkOrganizeSnapshots(snapshots.filter((snapshot) => snapshot.id !== id));
 }
 
 export async function saveLastAction(action: ActionJournal): Promise<void> {

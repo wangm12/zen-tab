@@ -1,0 +1,49 @@
+name: Publish Chrome Web Store
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: cws-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Package & Publish to Chrome Web Store
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run typecheck, tests & build
+        run: npm run check
+
+      - name: Package zip
+        run: npm run package
+
+      - name: Upload and submit for review
+        uses: mnao305/chrome-extension-upload@v7.0.0
+        with:
+          file-path: 'dist/zen-tab-*.zip'
+          glob: true
+          extension-id: ohidmgoebmnndohkhfcillfjhkppgbko
+          publisher-id: 8b53592f-0935-4a6b-9ff2-04d61db9b50d
+          client-id: ${{ secrets.CWS_CLIENT_ID || secrets.CLIENT_ID }}
+          client-secret: ${{ secrets.CWS_CLIENT_SECRET || secrets.CLIENT_SECRET }}
+          refresh-token: ${{ secrets.CWS_REFRESH_TOKEN || secrets.REFRESH_TOKEN }}
+          publish: true

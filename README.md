@@ -12,8 +12,9 @@ Zen Tab is a Manifest V3 Chrome extension for people who work with many tabs. It
 
 ## Highlights
 
-- **Live tab workspace** — Browse windows, native tab groups, and ungrouped tabs from Chrome's side panel.
-- **Duplicate guard** — Detect repeated pages using conservative URL normalization. Actions are fast, reversible, and isolated between normal and private windows.
+- **Live tab workspace** — Browse windows, native tab groups, and ungrouped tabs from a narrow side panel: search and settings on top, Tabs / Stash / Bookmarks below.
+- **Duplicate guard** — Detect repeated pages as soon as a URL is ready. Actions are fast, reversible, and isolated between normal and private windows.
+- **Bookmark inbox** — Optional bookmark access to file Inbox items into existing folders, review duplicates before deleting, and fuzzy-search title, URL, folder, or an optional page summary.
 - **Project-aware grouping** — Suggests groups from titles, URL paths, search terms, and optional page context instead of grouping by domain alone.
 - **Safe cleanup** — Recommends low-value tabs for review; nothing is closed until you confirm it.
 - **Stash and restore** — Save a window, group, or selection locally, close the saved tabs, and restore them later in a new window.
@@ -79,11 +80,11 @@ Zen Tab is built with:
 
 - Manifest V3
 - React + Vite + TypeScript
-- Chrome `sidePanel`, `tabs`, `tabGroups`, and `storage` APIs
+- Chrome `sidePanel`, `tabs`, `tabGroups`, `storage`, and optional `bookmarks` APIs
 - A service worker as the source of truth for tab state and browser mutations
 - Virtualized side-panel rendering for large tab collections
 - A provider interface for local and optional cloud AI analysis
 
 ## Project status
 
-Zen Tab is currently an active development project. The core side-panel workspace, duplicate handling, stash/restore flow, AI grouping preview, conservative cleanup flow, settings, localization, undo behavior, and performance-oriented state updates are implemented. Chrome Desktop is the supported target for now.
+Zen Tab is currently an active development project. The side-panel workspace, early duplicate handling, stash/restore, bookmark inbox, AI grouping preview, conservative cleanup, settings, localization, undo, and event-driven updates are implemented. Chrome Desktop is the supported target for now.

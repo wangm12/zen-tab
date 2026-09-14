@@ -40,30 +40,42 @@ export type WindowSnapshot = {
 export type DuplicateScope = 'same-window' | 'all-normal-windows';
 export type Language = 'en' | 'zh';
 export type ThemePreference = 'system' | 'light' | 'dark';
+export type AiProviderKind = 'local' | 'openai-compatible';
+export type AutoDiscardMinutes = 15 | 30 | 60 | 120;
 
 export type ZenTabSettings = {
   language: Language;
   theme: ThemePreference;
+  atmosphereEnabled: boolean;
   duplicateEnabled: boolean;
   duplicateScope: DuplicateScope;
   ignoredDomains: string[];
   protectedDomains: string[];
   deepAnalysisEnabled: boolean;
-  aiProvider: 'local' | 'groq';
-  groqModel: string;
+  aiProvider: AiProviderKind;
+  openaiBaseUrl: string;
+  openaiModel: string;
+  autoDiscardEnabled: boolean;
+  autoDiscardMinutes: AutoDiscardMinutes;
+  autoDiscardInspectPages: boolean;
   incognitoEnabled: boolean;
 };
 
 export const DEFAULT_SETTINGS: ZenTabSettings = {
   language: 'en',
   theme: 'system',
+  atmosphereEnabled: true,
   duplicateEnabled: true,
   duplicateScope: 'all-normal-windows',
   ignoredDomains: [],
   protectedDomains: ['figma.com', 'docs.google.com', 'meet.google.com', 'slack.com', 'discord.com', 'linear.app', 'notion.so', 'zoom.us', 'teams.microsoft.com', 'miro.com', 'localhost'],
   deepAnalysisEnabled: false,
   aiProvider: 'local',
-  groqModel: 'llama-3.3-70b-versatile',
+  openaiBaseUrl: 'https://api.groq.com/openai/v1',
+  openaiModel: 'llama-3.3-70b-versatile',
+  autoDiscardEnabled: false,
+  autoDiscardMinutes: 30,
+  autoDiscardInspectPages: false,
   incognitoEnabled: false,
 };
 
@@ -99,7 +111,7 @@ export type StashRecord = {
 
 export type ActionJournal = {
   actionId: string;
-  type: 'duplicate' | 'group' | 'cleanup' | 'stash';
+  type: 'duplicate' | 'group' | 'cleanup' | 'stash' | 'close' | 'bookmark';
   createdAt: number;
   affectedTabIds: number[];
   restoreData?: unknown;
@@ -132,7 +144,7 @@ export type ProjectGroupProposal = {
 
 export type GroupProposal = {
   proposalId: string;
-  provider: 'local-heuristic' | 'local-model' | 'groq';
+  provider: 'local-heuristic' | 'local-model' | 'groq' | 'openai-compatible';
   groups: ProjectGroupProposal[];
   unclassifiedTabIds: number[];
   analyzedTabCount: number;
@@ -148,6 +160,72 @@ export type ProjectMemoryRule = {
   createdAt: number;
   updatedAt: number;
   useCount: number;
+};
+
+export type BookmarkFolderKind = 'bar' | 'other' | 'mobile' | 'folder' | 'managed';
+
+export type BookmarkOrganizeScope = 'unfiled' | 'bar' | 'other' | 'all';
+
+export type BookmarkRecord = {
+  id: string;
+  parentId: string;
+  title: string;
+  url: string;
+  dateAdded?: number;
+  folderPath: string;
+  summary?: string;
+  isInbox: boolean;
+  isBookmarksBar: boolean;
+  folderKind: BookmarkFolderKind;
+  index: number;
+  unmodifiable?: 'managed';
+};
+
+export type BookmarkFolderRecord = {
+  id: string;
+  parentId?: string;
+  title: string;
+  folderPath: string;
+  isInbox: boolean;
+  isSpecialRoot: boolean;
+  isBookmarksBar: boolean;
+  folderKind: BookmarkFolderKind;
+  index: number;
+  unmodifiable?: 'managed';
+};
+
+export type BookmarkOrganizeSnapshot = {
+  id: string
+  createdAt: number
+  expiresAt: number
+  moveCount: number
+  createdFolderIds: string[]
+  nodes: Array<{ id: string; parentId: string; index: number }>
+}
+
+export type BookmarkOrganizeSnapshotSummary = {
+  id: string
+  createdAt: number
+  expiresAt: number
+  moveCount: number
+}
+
+export type BookmarkFolderSuggestion = {
+  folderId: string;
+  folderTitle: string;
+  confidence: 'high' | 'medium' | 'low';
+  reason: string;
+};
+
+export type BookmarkDuplicateGroup = {
+  canonicalUrl: string;
+  keepId: string;
+  removeIds: string[];
+};
+
+export type BookmarkSearchResult = {
+  bookmark: BookmarkRecord;
+  score: number;
 };
 
 export type GroupUndoData =
@@ -181,12 +259,22 @@ export type ToastMessage = {
   action?: 'undo' | 'open-settings';
 };
 
+export type RecentSession = {
+  sessionId: string;
+  lastModified: number;
+  title: string;
+  tabCount: number;
+  kind: 'tab' | 'window';
+  url?: string;
+  favIconUrl?: string;
+};
+
 export type ZenTabSnapshot = {
   windows: WindowSnapshot[];
   stashes: StashRecord[];
   projectMemory: ProjectMemoryRule[];
   settings: ZenTabSettings;
-  hasGroqApiKey: boolean;
+  hasCloudApiKey: boolean;
   lastAction?: ActionJournal;
 };
 
@@ -200,10 +288,36 @@ export type GroupScanProgress = {
 
 export type ZenTabMessage =
   | { type: 'GET_SNAPSHOT' }
-  | { type: 'RUN_GROUP_ANALYSIS'; windowId: number; deepScanAll?: boolean }
+  | { type: 'GET_BOOKMARK_TREE' }
+  | { type: 'FILE_BOOKMARKS'; bookmarkIds: string[]; folderId: string }
+  | {
+    type: 'APPLY_BOOKMARK_FILING'
+    creates: Array<{ clientId: string; parentId: string; title: string }>
+    moves: Array<{ bookmarkId: string; folderId: string }>
+  }
+  | { type: 'ANALYZE_BOOKMARK_ORGANIZE'; scope?: BookmarkOrganizeScope }
+  | {
+    type: 'APPLY_BOOKMARK_ORGANIZE'
+    creates: Array<{ clientId: string; parentId: string; title: string }>
+    moves: Array<{ bookmarkId: string; folderId: string }>
+    scope?: BookmarkOrganizeScope
+  }
+  | { type: 'RESTORE_BOOKMARK_ORGANIZE'; snapshotId: string }
+  | { type: 'GET_BOOKMARK_ORGANIZE_SNAPSHOTS' }
+  | { type: 'APPLY_BOOKMARK_DEDUP'; groups: Array<{ keepId: string; removeIds: string[] }> }
+  | { type: 'SUGGEST_BOOKMARK_FILE'; bookmarkId: string }
+  | { type: 'RUN_GROUP_ANALYSIS'; windowId: number; deepScanAll?: boolean; tabIds?: number[] }
+  | { type: 'GROUP_TABS'; windowId: number; tabIds: number[]; title?: string; color?: GroupColor }
+  | { type: 'CREATE_BOOKMARKS'; folderId?: string; tabs: Array<{ title: string; url: string }> }
+  | { type: 'UPDATE_BOOKMARK'; id: string; title: string; url?: string }
+  | { type: 'REMOVE_BOOKMARK'; id: string }
+  | { type: 'CREATE_BOOKMARK_FOLDER'; parentId: string; title: string }
+  | { type: 'REMOVE_BOOKMARK_FOLDER'; id: string }
+  | { type: 'MOVE_BOOKMARK'; id: string; parentId: string; index?: number }
+  | { type: 'OPEN_BOOKMARK_URLS'; urls: string[] }
   | { type: 'APPLY_GROUP_PROPOSAL'; proposal: GroupProposal }
   | { type: 'RUN_CLEANUP_ANALYSIS'; windowId: number }
-  | { type: 'APPLY_CLEANUP'; proposalId: string; tabIds: number[] }
+  | { type: 'APPLY_CLEANUP'; proposal: CleanupProposal; tabIds: number[] }
   | { type: 'STASH'; windowId: number; scope: 'window' | 'group' | 'tabs'; groupId?: number; tabIds?: number[]; includePinned?: boolean; includeActive?: boolean }
   | { type: 'STASH_WINDOW'; windowId: number; includePinned?: boolean; includeActive?: boolean }
   | { type: 'RESTORE_STASH'; stashId: string }
@@ -212,10 +326,13 @@ export type ZenTabMessage =
   | { type: 'DELETE_STASH'; stashId: string }
   | { type: 'UNDO_ACTION' }
   | { type: 'CLEAR_PROJECT_MEMORY' }
-  | { type: 'UPDATE_GROUP'; groupId: number; action: 'rename' | 'color'; title?: string; color?: GroupColor }
+  | { type: 'UPDATE_GROUP'; groupId: number; action: 'rename' | 'color' | 'collapse'; title?: string; color?: GroupColor; collapsed?: boolean }
   | { type: 'UNGROUP_GROUP'; groupId: number }
   | { type: 'UPDATE_SETTINGS'; patch: Partial<ZenTabSettings> }
-  | { type: 'UPDATE_GROQ_KEY'; apiKey: string }
+  | { type: 'UPDATE_CLOUD_KEY'; apiKey: string }
+  | { type: 'IMPORT_STASHES'; stashes: StashRecord[] }
+  | { type: 'LIST_RECENT_SESSIONS' }
+  | { type: 'RESTORE_SESSION'; sessionId: string }
   | { type: 'CLOSE_TABS'; tabIds: number[] }
   | { type: 'MOVE_TAB'; tabId: number; windowId: number; index: number }
   | { type: 'GROUP_TAB'; tabId: number; groupId: number }
@@ -223,13 +340,15 @@ export type ZenTabMessage =
 
 export type ZenTabEvent =
   | { type: 'SNAPSHOT_UPDATED'; snapshot: ZenTabSnapshot }
+  | { type: 'BOOKMARKS_UPDATED' }
+  | { type: 'BOOKMARK_FILING_SUGGESTED'; bookmarkId: string; title: string; url: string; suggestion: BookmarkFolderSuggestion | null }
   | { type: 'TOAST'; toast: ToastMessage }
   | { type: 'GROUP_SCAN_PROGRESS'; windowId: number; scanned: number; total: number; mode: 'adaptive' | 'full' }
   | { type: 'RESTORE_PROGRESS'; stashId: string; completed: number; total: number };
 
 export type ProviderCapabilities = {
   available: boolean;
-  name: 'local-model' | 'groq' | 'heuristic';
+  name: 'local-model' | 'openai-compatible' | 'heuristic';
   supportsSummaries: boolean;
 };
 

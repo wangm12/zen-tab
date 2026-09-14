@@ -56,6 +56,51 @@ export function getHostname(rawUrl: string): string {
   }
 }
 
+const TWO_LEVEL_PUBLIC_SUFFIXES = new Set([
+  'co.uk',
+  'com.cn',
+  'net.cn',
+  'org.cn',
+  'edu.cn',
+  'gov.cn',
+  'co.jp',
+  'ne.jp',
+  'com.au',
+  'net.au',
+  'org.au',
+  'co.nz',
+  'net.nz',
+  'org.nz',
+  'com.tw',
+  'org.tw',
+  'com.hk',
+  'org.hk',
+  'com.sg',
+  'co.in',
+  'com.br',
+  'github.io',
+  'gitlab.io',
+  'pages.dev',
+  'vercel.app',
+  'netlify.app',
+]);
+
+export function rootDomainFromHost(host: string): string {
+  const cleaned = host.trim().toLowerCase().replace(/^www\./, '');
+  if (!cleaned) return '';
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(cleaned) || cleaned.includes(':')) {
+    return cleaned;
+  }
+  const parts = cleaned.split('.').filter(Boolean);
+  if (parts.length <= 2) return cleaned;
+
+  const lastTwo = parts.slice(-2).join('.');
+  if (TWO_LEVEL_PUBLIC_SUFFIXES.has(lastTwo)) {
+    return parts.slice(-3).join('.');
+  }
+  return parts.slice(-2).join('.');
+}
+
 export function isLocalAddress(rawUrl: string): boolean {
   const hostname = getHostname(rawUrl);
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0' || hostname.endsWith('.local');
@@ -71,18 +116,23 @@ const STOP_WORDS = new Set([
   'docs', 'home', 'index', 'the', 'and', 'for', 'with', 'from', 'this', 'that', 'new', 'login',
 ]);
 
-export function extractProjectTokens(input: { title: string; url: string; summary?: string }): string[] {
-  const source = `${input.title} ${input.title} ${input.url} ${input.summary ?? ''}`
+function tokenize(source: string): string[] {
+  return source
     .replace(/[/?#=&%_.:+\-()[\]{}"'`,;|]+/g, ' ')
     .replace(/\b\d{5,}\b/g, ' ')
-    .toLowerCase();
-
-  const tokens = source
+    .toLowerCase()
     .split(/\s+/)
     .map((token) => token.trim())
     .filter((token) => token.length >= 3 && !STOP_WORDS.has(token) && !/^[0-9]+$/.test(token));
+}
 
-  return [...new Set(tokens)];
+export function hostTokensFromUrl(rawUrl: string): Set<string> {
+  const hostname = getHostname(rawUrl).replace(/^www\./, '');
+  return new Set(tokenize(hostname.replace(/\./g, ' ')));
+}
+
+export function extractProjectTokens(input: { title: string; url: string; summary?: string }): string[] {
+  return [...new Set(tokenize(`${input.title} ${input.title} ${input.url} ${input.summary ?? ''}`))];
 }
 
 export function displayHostname(rawUrl: string): string {
