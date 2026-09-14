@@ -10,9 +10,11 @@ Zen Tab is a Manifest V3 Chrome extension designed for people who work with many
 
 ## Preview
 
-<p align="center">
-  <img src="docs/screenshots/zen-tab-workspace.png" alt="Zen Tab side-panel workspace" width="380" />
-</p>
+![Zen Tab Workspace](docs/store/screenshot-1-tabs.png)
+
+<br/>
+
+![Zen Tab Bookmarks & Stash](docs/store/screenshot-2-bookmarks.png)
 
 ---
 

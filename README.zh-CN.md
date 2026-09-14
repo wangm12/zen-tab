@@ -10,9 +10,11 @@ Zen Tab 是一款面向重度标签用户的 Manifest V3 Chrome 扩展。它将 
 
 ## 产品预览
 
-<p align="center">
-  <img src="docs/screenshots/zen-tab-workspace.png" alt="Zen Tab 侧边栏工作区" width="380" />
-</p>
+![Zen Tab 侧边栏工作区](docs/store/screenshot-1-tabs.png)
+
+<br/>
+
+![Zen Tab 书签管理与收件箱](docs/store/screenshot-2-bookmarks.png)
 
 ---
 
